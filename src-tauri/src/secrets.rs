@@ -30,10 +30,3 @@ pub fn set_slack_webhook(url: &str) -> Result<(), AppError> {
         .set_password(url)
         .map_err(|e| AppError::Internal(format!("keychain write failed: {e}")))
 }
-
-pub fn delete_slack_webhook() -> Result<(), AppError> {
-    match entry()?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(AppError::Internal(format!("keychain delete failed: {e}"))),
-    }
-}

@@ -38,6 +38,9 @@ pub struct Alert {
     /// Status the alert was fired for; dispatch drops it if the monitor has
     /// since moved on.
     pub fired_for_status: &'static str,
+    /// Identifies the specific up/down episode, so an old down alert cannot
+    /// be delivered during a later down incident.
+    pub fired_for_status_changed_at: Option<String>,
     /// New `down_alert_sent_at` value to store when this alert dispatches.
     pub sent_at_update: Option<String>,
 }
@@ -56,6 +59,7 @@ pub fn decide_after_check(recorded: &RecordedCheck, now: DateTime<Utc>) -> Optio
                 title: "Monitor down".into(),
                 body: format!("{} is down: {reason}", recorded.after.url),
                 fired_for_status: uptime_status::DOWN,
+                fired_for_status_changed_at: recorded.after.status_last_change_at.clone(),
                 sent_at_update: Some(now.to_rfc3339()),
             })
         }
@@ -69,6 +73,7 @@ pub fn decide_after_check(recorded: &RecordedCheck, now: DateTime<Utc>) -> Optio
                 title: "Monitor recovered".into(),
                 body: format!("{} is back up after {downtime}", recorded.after.url),
                 fired_for_status: uptime_status::UP,
+                fired_for_status_changed_at: recorded.after.status_last_change_at.clone(),
                 sent_at_update: None,
             })
         }
@@ -99,14 +104,20 @@ pub fn decide_still_down(monitor: &Monitor, now: DateTime<Utc>) -> Option<Alert>
         title: "Monitor still down".into(),
         body: format!("{} has been down for {downtime}", monitor.url),
         fired_for_status: uptime_status::DOWN,
+        fired_for_status_changed_at: monitor.status_last_change_at.clone(),
         sent_at_update: Some(now.to_rfc3339()),
     })
 }
 
 /// Stale guard: the alert only goes out if the monitor is still in the
 /// status it was fired for.
-pub fn is_stale(alert: &Alert, current_status: &str) -> bool {
+pub fn is_stale(
+    alert: &Alert,
+    current_status: &str,
+    current_status_changed_at: Option<&str>,
+) -> bool {
     current_status != alert.fired_for_status
+        || current_status_changed_at != alert.fired_for_status_changed_at.as_deref()
 }
 
 pub fn slack_text(alert: &Alert, now: DateTime<Utc>) -> String {
@@ -141,7 +152,11 @@ pub fn human_duration_between(start: Option<&str>, end: DateTime<Utc>) -> String
 fn alert_is_current(store: &Store, alert: &Alert) -> bool {
     match store.get_monitor(alert.monitor_id) {
         Ok(current) => {
-            if is_stale(&alert, &current.uptime_status) {
+            if is_stale(
+                alert,
+                &current.uptime_status,
+                current.status_last_change_at.as_deref(),
+            ) {
                 tracing::info!(
                     monitor_id = alert.monitor_id,
                     "dropping stale alert: status moved on"
@@ -158,6 +173,7 @@ fn record_delivery(store: &Store, alert: &Alert) -> bool {
     match store.set_down_alert_sent_at_if_status(
         alert.monitor_id,
         alert.fired_for_status,
+        alert.fired_for_status_changed_at.as_deref(),
         alert.sent_at_update.as_deref(),
     ) {
         Ok(recorded) => recorded,
@@ -172,6 +188,7 @@ fn record_delivery(store: &Store, alert: &Alert) -> bool {
 /// at each delivery boundary, and bookkeeping is written only after a channel
 /// accepts the alert. Channel failures are logged, never propagated.
 pub async fn dispatch(app: &AppHandle, store: &Arc<Store>, alert: Alert) {
+    let _alerting = store.lock_alerting().await;
     let mut delivery_recorded = false;
 
     if alert_is_current(store, &alert) {
@@ -341,10 +358,12 @@ mod tests {
             title: String::new(),
             body: String::new(),
             fired_for_status: "down",
+            fired_for_status_changed_at: Some("episode-1".into()),
             sent_at_update: None,
         };
-        assert!(is_stale(&alert, "up"));
-        assert!(!is_stale(&alert, "down"));
+        assert!(is_stale(&alert, "up", Some("episode-1")));
+        assert!(is_stale(&alert, "down", Some("episode-2")));
+        assert!(!is_stale(&alert, "down", Some("episode-1")));
     }
 
     #[test]
@@ -355,6 +374,7 @@ mod tests {
             title: String::new(),
             body: "x is down".into(),
             fired_for_status: "down",
+            fired_for_status_changed_at: None,
             sent_at_update: None,
         };
         assert!(slack_text(&down, now).starts_with("🔴"));
