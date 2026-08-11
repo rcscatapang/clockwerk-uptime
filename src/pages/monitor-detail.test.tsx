@@ -69,6 +69,8 @@ beforeEach(() => {
     certExpiresAt: null,
     certIssuer: null,
     certFailureReason: null,
+    certLastCheckAt: null,
+    certExpiryAlertSentAt: null,
     createdAt: "2026-08-01T00:00:00.000Z",
     updatedAt: "2026-08-11T00:00:00.000Z",
     lastResponseTimeMs: 300,

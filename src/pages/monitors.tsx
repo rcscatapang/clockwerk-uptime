@@ -46,6 +46,28 @@ function StatusBadge({ monitor }: { monitor: Monitor }) {
   );
 }
 
+function CertificateBadge({ monitor }: { monitor: Monitor }) {
+  if (!monitor.certCheckEnabled) return <span>Off</span>;
+  if (monitor.certStatus === "invalid") {
+    return <Badge variant="destructive">Certificate issue</Badge>;
+  }
+  if (monitor.certStatus === "not_yet_checked") {
+    return <span>Not checked</span>;
+  }
+  const expiresAt = monitor.certExpiresAt
+    ? new Date(monitor.certExpiresAt).getTime()
+    : Number.NaN;
+  const daysRemaining = Math.ceil((expiresAt - Date.now()) / 86_400_000);
+  if (Number.isFinite(daysRemaining) && daysRemaining <= 10) {
+    return (
+      <Badge variant="outline" className="border-amber-500 text-amber-700">
+        Expires in {Math.max(0, daysRemaining)}d
+      </Badge>
+    );
+  }
+  return <span>Valid</span>;
+}
+
 export function MonitorsPage() {
   const monitors = useMonitors();
   const updateMonitor = useUpdateMonitor();
@@ -126,7 +148,7 @@ export function MonitorsPage() {
                 <TableCell>{monitor.checkIntervalMinutes} min</TableCell>
                 <TableCell>{monitor.checkMethod}</TableCell>
                 <TableCell className="text-muted-foreground">
-                  {monitor.certCheckEnabled ? "Checked" : "Off"}
+                  <CertificateBadge monitor={monitor} />
                 </TableCell>
                 <TableCell>
                   <Switch
