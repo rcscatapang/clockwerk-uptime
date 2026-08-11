@@ -61,6 +61,14 @@ const MIGRATIONS: &[&str] = &[
     ",
 ];
 
+/// The `monitors.uptime_status` values. Stored as text; the frontend types
+/// declare the same union.
+pub mod uptime_status {
+    pub const NOT_YET_CHECKED: &str = "not_yet_checked";
+    pub const UP: &str = "up";
+    pub const DOWN: &str = "down";
+}
+
 /// ISO-8601 UTC timestamp — the one time format stored in the DB.
 pub fn now_utc() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -113,6 +121,8 @@ pub struct Monitor {
     pub cert_failure_reason: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Latest real check's response time; derived, not a monitors column.
+    pub last_response_time_ms: Option<i64>,
 }
 
 // Not constructed yet; the check engine will produce these rows.
@@ -375,6 +385,66 @@ impl Store {
         })
     }
 
+    // --- check recording ----------------------------------------------------
+
+    /// Apply one check outcome atomically: read the monitor, run the state
+    /// machine, update the monitor row, insert the `check_results` row.
+    /// Returns the updated monitor and the transition that fired, if any.
+    pub fn record_check(
+        &self,
+        id: i64,
+        outcome: &crate::checker::CheckOutcome,
+    ) -> Result<(Monitor, Option<crate::state::TransitionEvent>), AppError> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            let monitor = tx.query_row(
+                &format!("SELECT {MONITOR_COLUMNS} FROM monitors WHERE id = ?1"),
+                params![id],
+                monitor_from_row,
+            )?;
+            let now = now_utc();
+            let change = crate::state::apply(&monitor, outcome, &now);
+            tx.execute(
+                "UPDATE monitors SET
+                   uptime_status = ?1,
+                   consecutive_failures = ?2,
+                   uptime_failure_reason = ?3,
+                   status_last_change_at = COALESCE(?4, status_last_change_at),
+                   last_check_at = ?5,
+                   updated_at = ?5
+                 WHERE id = ?6",
+                params![
+                    change.uptime_status,
+                    change.consecutive_failures,
+                    change.uptime_failure_reason,
+                    change.status_changed_at,
+                    now,
+                    id,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO check_results
+                   (monitor_id, checked_at, status, http_status_code, response_time_ms, failure_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    now,
+                    change.result_status,
+                    outcome.http_status,
+                    outcome.response_time_ms,
+                    outcome.failure_reason,
+                ],
+            )?;
+            let updated = tx.query_row(
+                &format!("SELECT {MONITOR_COLUMNS} FROM monitors WHERE id = ?1"),
+                params![id],
+                monitor_from_row,
+            )?;
+            tx.commit()?;
+            Ok((updated, change.event))
+        })
+    }
+
     // --- settings -----------------------------------------------------------
 
     pub fn get_settings(&self) -> Result<Settings, AppError> {
@@ -415,7 +485,10 @@ const MONITOR_COLUMNS: &str = "id, url, uptime_check_enabled, check_interval_min
      check_method, look_for_string, uptime_status, uptime_failure_reason, \
      consecutive_failures, status_last_change_at, last_check_at, down_alert_sent_at, \
      cert_check_enabled, cert_status, cert_expires_at, cert_issuer, \
-     cert_failure_reason, created_at, updated_at";
+     cert_failure_reason, created_at, updated_at, \
+     (SELECT response_time_ms FROM check_results c \
+        WHERE c.monitor_id = monitors.id AND c.status != 'gap' \
+        ORDER BY c.checked_at DESC, c.id DESC LIMIT 1) AS last_response_time_ms";
 
 fn get_monitor_inner(conn: &Connection, id: i64) -> Result<Monitor, AppError> {
     conn.query_row(
@@ -447,6 +520,7 @@ fn monitor_from_row(row: &Row) -> Result<Monitor, rusqlite::Error> {
         cert_failure_reason: row.get(16)?,
         created_at: row.get(17)?,
         updated_at: row.get(18)?,
+        last_response_time_ms: row.get(19)?,
     })
 }
 
