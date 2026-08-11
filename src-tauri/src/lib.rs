@@ -10,46 +10,98 @@
 //     last window being destroyed) is vetoed so the process never dies silently;
 //     an explicit `app.exit(..)` from the tray passes through.
 
+mod error;
+mod store;
+
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Manager,
+    Manager, State,
 };
 use tauri_plugin_autostart::ManagerExt;
 
-/// App settings exposed to the frontend. Held in memory / OS state for now;
-/// issue 02 moves persistence into SQLite.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
-pub struct Settings {
-    pub autostart_enabled: bool,
+use error::AppError;
+use store::{Monitor, MonitorInput, Settings, Store};
+
+#[tauri::command]
+fn list_monitors(store: State<Store>) -> Result<Vec<Monitor>, AppError> {
+    store.list_monitors()
 }
 
 #[tauri::command]
-fn get_settings(app: tauri::AppHandle) -> Result<Settings, String> {
-    let autostart_enabled = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
-    Ok(Settings { autostart_enabled })
+fn get_monitor(store: State<Store>, id: i64) -> Result<Monitor, AppError> {
+    store.get_monitor(id)
 }
 
 #[tauri::command]
-fn update_settings(app: tauri::AppHandle, settings: Settings) -> Result<Settings, String> {
+fn create_monitor(store: State<Store>, input: MonitorInput) -> Result<Monitor, AppError> {
+    store.create_monitor(&input)
+}
+
+#[tauri::command]
+fn update_monitor(store: State<Store>, id: i64, input: MonitorInput) -> Result<Monitor, AppError> {
+    store.update_monitor(id, &input)
+}
+
+#[tauri::command]
+fn delete_monitor(store: State<Store>, id: i64) -> Result<(), AppError> {
+    store.delete_monitor(id)
+}
+
+#[tauri::command]
+fn get_settings(store: State<Store>) -> Result<Settings, AppError> {
+    store.get_settings()
+}
+
+/// Persists settings in SQLite and applies side effects (autostart registration).
+/// The DB is the source of truth for the toggle; the OS registration follows it.
+#[tauri::command]
+fn update_settings(
+    app: tauri::AppHandle,
+    store: State<Store>,
+    settings: Settings,
+) -> Result<Settings, AppError> {
     let autolaunch = app.autolaunch();
-    let currently_enabled = autolaunch.is_enabled().map_err(|e| e.to_string())?;
-    if settings.autostart_enabled != currently_enabled {
-        if settings.autostart_enabled {
-            autolaunch.enable().map_err(|e| e.to_string())?;
+    let apply = |enabled: bool| {
+        if enabled {
+            autolaunch.enable()
         } else {
-            autolaunch.disable().map_err(|e| e.to_string())?;
+            autolaunch.disable()
         }
+    };
+    apply(settings.autostart_enabled)
+        .map_err(|e| AppError::Internal(format!("could not update launch at login: {e}")))?;
+    if let Err(e) = store.save_settings(&settings) {
+        // Keep OS registration and DB in sync: revert the registration
+        // (best effort) if persisting failed.
+        let _ = apply(!settings.autostart_enabled);
+        return Err(e);
     }
-    get_settings(app)
+    store.get_settings()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![get_settings, update_settings])
+        .invoke_handler(tauri::generate_handler![
+            list_monitors,
+            get_monitor,
+            create_monitor,
+            update_monitor,
+            delete_monitor,
+            get_settings,
+            update_settings
+        ])
         .setup(|app| {
+            // Open the store before anything else can touch the DB; migrations
+            // run inside `Store::open`.
+            let data_dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&data_dir)?;
+            let store = Store::open(&data_dir.join("monitor.db"))
+                .map_err(|e| format!("failed to open monitor.db: {e}"))?;
+            app.manage(store);
+
             let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &quit])?;
