@@ -42,10 +42,16 @@ Design rules:
 | Monitor goes down after two consecutive failures | Sent | Sent when configured |
 | Monitor remains down for 60 minutes | Sent again every hour | Sent again every hour when configured |
 | Monitor recovers after a delivered down alert | Sent with downtime | Sent with downtime when configured |
+| Certificate becomes invalid | Sent once per invalid transition | Sent once per invalid transition when configured |
+| Valid certificate expires within 10 days | Sent at most once per day | Sent at most once per day when configured |
 
 A recovery stays silent when the preceding failures never produced a down
 alert. Saving a Slack webhook sends a test message before the URL is stored in
 macOS Keychain; removing it leaves native alerts enabled.
+
+Certificate checks run daily for enabled HTTPS monitors and immediately on the
+first scheduler tick after creation or enabling. They use the platform trust
+store and retain the leaf certificate's issuer and expiry when available.
 
 ## Stack
 

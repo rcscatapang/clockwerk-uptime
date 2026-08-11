@@ -26,7 +26,10 @@ use tauri_plugin_notification::NotificationExt;
 use crate::secrets;
 use crate::slack;
 use crate::state::TransitionEvent;
-use crate::store::{uptime_status, Monitor, RecordedCheck, Store};
+use crate::store::{
+    uptime_status, CertificateEvent, CertificateStatus, Monitor, RecordedCertificateCheck,
+    RecordedCheck, Store,
+};
 
 pub const REALERT_AFTER_MINUTES: i64 = 60;
 
@@ -43,6 +46,98 @@ pub struct Alert {
     pub fired_for_status_changed_at: Option<String>,
     /// New `down_alert_sent_at` value to store when this alert dispatches.
     pub sent_at_update: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertificateAlert {
+    pub monitor_id: i64,
+    pub title: String,
+    pub body: String,
+    pub fired_for_status: CertificateStatus,
+    pub fired_for_check_at: String,
+    pub expiry_sent_at_update: Option<String>,
+}
+
+trait DeliverableAlert {
+    fn monitor_id(&self) -> i64;
+    fn content(&self) -> (&str, &str);
+    fn is_stale(&self, current: &Monitor) -> bool;
+    fn record_delivery(&self, store: &Store) -> Result<bool, crate::error::AppError>;
+    fn slack_text(&self, now: DateTime<Utc>) -> String;
+}
+
+impl DeliverableAlert for Alert {
+    fn monitor_id(&self) -> i64 {
+        self.monitor_id
+    }
+
+    fn content(&self) -> (&str, &str) {
+        (&self.title, &self.body)
+    }
+
+    fn is_stale(&self, current: &Monitor) -> bool {
+        is_stale(
+            self,
+            &current.uptime_status,
+            current.status_last_change_at.as_deref(),
+        )
+    }
+
+    fn record_delivery(&self, store: &Store) -> Result<bool, crate::error::AppError> {
+        store.set_down_alert_sent_at_if_status(
+            self.monitor_id,
+            self.fired_for_status,
+            self.fired_for_status_changed_at.as_deref(),
+            self.sent_at_update.as_deref(),
+        )
+    }
+
+    fn slack_text(&self, now: DateTime<Utc>) -> String {
+        slack_text(self, now)
+    }
+}
+
+impl DeliverableAlert for CertificateAlert {
+    fn monitor_id(&self) -> i64 {
+        self.monitor_id
+    }
+
+    fn content(&self) -> (&str, &str) {
+        (&self.title, &self.body)
+    }
+
+    fn is_stale(&self, current: &Monitor) -> bool {
+        is_certificate_stale(
+            self,
+            current.cert_status,
+            current.cert_last_check_at.as_deref(),
+        )
+    }
+
+    fn record_delivery(&self, store: &Store) -> Result<bool, crate::error::AppError> {
+        match &self.expiry_sent_at_update {
+            Some(sent_at) => store.set_cert_expiry_alert_sent_at_if_current(
+                self.monitor_id,
+                self.fired_for_status,
+                &self.fired_for_check_at,
+                sent_at,
+            ),
+            None => Ok(true),
+        }
+    }
+
+    fn slack_text(&self, now: DateTime<Utc>) -> String {
+        let emoji = if self.fired_for_status == CertificateStatus::Valid {
+            "⚠️"
+        } else {
+            "🔴"
+        };
+        format!(
+            "{emoji} {} ({})",
+            self.body,
+            now.format("%Y-%m-%d %H:%M UTC")
+        )
+    }
 }
 
 /// Decide the alert (if any) for a just-recorded check.
@@ -77,6 +172,47 @@ pub fn decide_after_check(recorded: &RecordedCheck, now: DateTime<Utc>) -> Optio
                 sent_at_update: None,
             })
         }
+    }
+}
+
+pub fn decide_after_certificate_check(
+    recorded: &RecordedCertificateCheck,
+    now: DateTime<Utc>,
+) -> Option<CertificateAlert> {
+    let checked_at = recorded.after.cert_last_check_at.clone()?;
+    match recorded.event.as_ref()? {
+        CertificateEvent::BecameInvalid => Some(CertificateAlert {
+            monitor_id: recorded.after.id,
+            title: "Certificate invalid".into(),
+            body: format!(
+                "{} has an invalid TLS certificate: {}",
+                recorded.after.url,
+                recorded
+                    .after
+                    .cert_failure_reason
+                    .as_deref()
+                    .unwrap_or("verification failed")
+            ),
+            fired_for_status: CertificateStatus::Invalid,
+            fired_for_check_at: checked_at,
+            expiry_sent_at_update: None,
+        }),
+        CertificateEvent::ExpiresSoon { days_remaining } => Some(CertificateAlert {
+            monitor_id: recorded.after.id,
+            title: "Certificate expires soon".into(),
+            body: format!(
+                "{} TLS certificate expires in {}",
+                recorded.after.url,
+                match days_remaining {
+                    0 => "less than a day".to_string(),
+                    1 => "1 day".to_string(),
+                    days => format!("{days} days"),
+                }
+            ),
+            fired_for_status: CertificateStatus::Valid,
+            fired_for_check_at: checked_at,
+            expiry_sent_at_update: Some(now.to_rfc3339()),
+        }),
     }
 }
 
@@ -120,6 +256,15 @@ pub fn is_stale(
         || current_status_changed_at != alert.fired_for_status_changed_at.as_deref()
 }
 
+pub fn is_certificate_stale(
+    alert: &CertificateAlert,
+    current_status: CertificateStatus,
+    current_last_check_at: Option<&str>,
+) -> bool {
+    current_status != alert.fired_for_status
+        || current_last_check_at != Some(alert.fired_for_check_at.as_str())
+}
+
 pub fn slack_text(alert: &Alert, now: DateTime<Utc>) -> String {
     let emoji = if alert.fired_for_status == uptime_status::UP {
         "✅"
@@ -149,56 +294,24 @@ pub fn human_duration_between(start: Option<&str>, end: DateTime<Utc>) -> String
     }
 }
 
-fn alert_is_current(store: &Store, alert: &Alert) -> bool {
-    match store.get_monitor(alert.monitor_id) {
-        Ok(current) => {
-            if is_stale(
-                alert,
-                &current.uptime_status,
-                current.status_last_change_at.as_deref(),
-            ) {
-                tracing::info!(
-                    monitor_id = alert.monitor_id,
-                    "dropping stale alert: status moved on"
-                );
-                return false;
-            }
-            true
-        }
-        Err(_) => false, // monitor deleted since the check
-    }
-}
-
-fn record_delivery(store: &Store, alert: &Alert) -> bool {
-    match store.set_down_alert_sent_at_if_status(
-        alert.monitor_id,
-        alert.fired_for_status,
-        alert.fired_for_status_changed_at.as_deref(),
-        alert.sent_at_update.as_deref(),
-    ) {
-        Ok(recorded) => recorded,
-        Err(e) => {
-            tracing::error!(monitor_id = alert.monitor_id, error = %e, "alert bookkeeping failed");
-            false
-        }
-    }
-}
-
 /// Deliver an alert to each configured channel. The monitor status is checked
 /// at each delivery boundary, and bookkeeping is written only after a channel
 /// accepts the alert. Channel failures are logged, never propagated.
 pub async fn dispatch(app: &AppHandle, store: &Arc<Store>, alert: Alert) {
+    dispatch_pending(app, store, alert).await;
+}
+
+pub async fn dispatch_certificate(app: &AppHandle, store: &Arc<Store>, alert: CertificateAlert) {
+    dispatch_pending(app, store, alert).await;
+}
+
+async fn dispatch_pending<A: DeliverableAlert>(app: &AppHandle, store: &Arc<Store>, alert: A) {
     let _alerting = store.lock_alerting().await;
     let mut delivery_recorded = false;
+    let (title, body) = alert.content();
 
     if alert_is_current(store, &alert) {
-        match app
-            .notification()
-            .builder()
-            .title(&alert.title)
-            .body(&alert.body)
-            .show()
-        {
+        match app.notification().builder().title(title).body(body).show() {
             Ok(()) => delivery_recorded = record_delivery(store, &alert),
             Err(e) => tracing::warn!(error = %e, "native notification failed"),
         }
@@ -206,7 +319,7 @@ pub async fn dispatch(app: &AppHandle, store: &Arc<Store>, alert: Alert) {
 
     match secrets::get_slack_webhook() {
         Ok(Some(webhook)) if alert_is_current(store, &alert) => {
-            match slack::send(&webhook, &slack_text(&alert, Utc::now())).await {
+            match slack::send(&webhook, &alert.slack_text(Utc::now())).await {
                 Ok(()) if !delivery_recorded => {
                     record_delivery(store, &alert);
                 }
@@ -220,10 +333,44 @@ pub async fn dispatch(app: &AppHandle, store: &Arc<Store>, alert: Alert) {
     }
 }
 
+fn alert_is_current(store: &Store, alert: &impl DeliverableAlert) -> bool {
+    let Ok(current) = store.get_monitor(alert.monitor_id()) else {
+        return false;
+    };
+    if alert.is_stale(&current) {
+        tracing::info!(
+            monitor_id = alert.monitor_id(),
+            "dropping stale alert: status moved on"
+        );
+        return false;
+    }
+    true
+}
+
+fn record_delivery(store: &Store, alert: &impl DeliverableAlert) -> bool {
+    match alert.record_delivery(store) {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            tracing::error!(error = %error, "alert bookkeeping failed");
+            false
+        }
+    }
+}
+
 /// Handle the alert consequences of one recorded check.
 pub async fn handle_check(app: &AppHandle, store: &Arc<Store>, recorded: &RecordedCheck) {
     if let Some(alert) = decide_after_check(recorded, Utc::now()) {
         dispatch(app, store, alert).await;
+    }
+}
+
+pub async fn handle_certificate_check(
+    app: &AppHandle,
+    store: &Arc<Store>,
+    recorded: &RecordedCertificateCheck,
+) {
+    if let Some(alert) = decide_after_certificate_check(recorded, Utc::now()) {
+        dispatch_certificate(app, store, alert).await;
     }
 }
 
@@ -264,10 +411,12 @@ mod tests {
             last_check_at: None,
             down_alert_sent_at: None,
             cert_check_enabled: false,
-            cert_status: "not_yet_checked".into(),
+            cert_status: CertificateStatus::NotYetChecked,
             cert_expires_at: None,
             cert_issuer: None,
             cert_failure_reason: None,
+            cert_last_check_at: None,
+            cert_expiry_alert_sent_at: None,
             created_at: String::new(),
             updated_at: String::new(),
             last_response_time_ms: None,
@@ -397,5 +546,47 @@ mod tests {
         assert_eq!(human_duration_between(ago(75).as_deref(), now), "1h 15m");
         assert_eq!(human_duration_between(ago(3000).as_deref(), now), "2d 2h");
         assert_eq!(human_duration_between(None, now), "an unknown time");
+    }
+
+    #[test]
+    fn certificate_alerts_format_and_guard_the_recorded_check() {
+        let now = Utc::now();
+        let mut after = monitor("up");
+        after.cert_status = CertificateStatus::Invalid;
+        after.cert_failure_reason = Some("certificate expired".into());
+        after.cert_last_check_at = Some("check-1".into());
+        let invalid = decide_after_certificate_check(
+            &RecordedCertificateCheck {
+                after,
+                event: Some(CertificateEvent::BecameInvalid),
+            },
+            now,
+        )
+        .unwrap();
+        assert!(invalid.body.contains("certificate expired"));
+        assert!(!is_certificate_stale(
+            &invalid,
+            CertificateStatus::Invalid,
+            Some("check-1")
+        ));
+        assert!(is_certificate_stale(
+            &invalid,
+            CertificateStatus::Valid,
+            Some("check-1")
+        ));
+
+        let mut expiring_after = monitor("up");
+        expiring_after.cert_status = CertificateStatus::Valid;
+        expiring_after.cert_last_check_at = Some("check-2".into());
+        let expiring = decide_after_certificate_check(
+            &RecordedCertificateCheck {
+                after: expiring_after,
+                event: Some(CertificateEvent::ExpiresSoon { days_remaining: 3 }),
+            },
+            now,
+        )
+        .unwrap();
+        assert!(expiring.body.contains("3 days"));
+        assert!(expiring.expiry_sent_at_update.is_some());
     }
 }

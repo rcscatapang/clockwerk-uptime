@@ -21,6 +21,7 @@
 //! event carries the affected monitor ids to the frontend, which invalidates
 //! its queries — the UI never polls.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +31,7 @@ use tokio::sync::Semaphore;
 
 use crate::checker::{self, CheckConfig};
 use crate::error::AppError;
-use crate::store::{uptime_status, Monitor, RecordedCheck, Store};
+use crate::store::{uptime_status, Monitor, RecordedCertificateCheck, RecordedCheck, Store};
 
 pub const TICK_INTERVAL: Duration = Duration::from_secs(30);
 pub const MAX_IN_FLIGHT: usize = 10;
@@ -139,38 +140,114 @@ pub async fn check_one(
     store.record_check(id, &outcome).await
 }
 
-/// Spawn the scheduler loop. Runs for the lifetime of the app, independent
-/// of window visibility.
-pub fn start(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        let store = app.state::<Arc<Store>>().inner().clone();
-        let ctx = app.state::<checker::CheckContext>();
-        let config = ctx.config;
-        let client = ctx.client.clone();
-        let mut interval = tokio::time::interval(TICK_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            match run_cycle(&store, &client, &config).await {
-                Ok(checked) => {
-                    for recorded in &checked {
-                        crate::alerter::handle_check(&app, &store, recorded).await;
-                    }
-                    crate::alerter::process_still_down(&app, &store).await;
-                    if !checked.is_empty() {
-                        let ids = checked.iter().map(|r| r.after.id).collect();
-                        if let Err(e) = app.emit(
-                            CHECK_COMPLETED_EVENT,
-                            CheckCompletedPayload { monitor_ids: ids },
-                        ) {
-                            tracing::error!(error = %e, "failed to emit check-completed");
-                        }
-                    }
-                }
-                Err(e) => tracing::error!(error = %e, "check cycle failed"),
+pub async fn check_certificate_one(
+    store: &Arc<Store>,
+    id: i64,
+) -> Result<Option<RecordedCertificateCheck>, AppError> {
+    let monitor = store.get_monitor(id)?;
+    if !monitor.cert_check_enabled {
+        return Ok(None);
+    }
+    let outcome = crate::certificate::run_check(&monitor.url).await;
+    store.record_certificate_check(id, &outcome)
+}
+
+pub async fn run_certificate_cycle(
+    store: &Arc<Store>,
+) -> Result<Vec<RecordedCertificateCheck>, AppError> {
+    let now = Utc::now();
+    let due: Vec<Monitor> = store
+        .list_monitors()?
+        .into_iter()
+        .filter(|monitor| crate::certificate::is_due(monitor, now))
+        .collect();
+    let mut checked = Vec::with_capacity(due.len());
+    for monitor in due {
+        let outcome = crate::certificate::run_check(&monitor.url).await;
+        match store.record_certificate_check(monitor.id, &outcome) {
+            Ok(Some(recorded)) => checked.push(recorded),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(monitor_id = monitor.id, error = %error, "failed to record certificate check")
             }
         }
-    });
+    }
+    Ok(checked)
+}
+
+async fn run_certificate_tick(app: &AppHandle, store: &Arc<Store>) -> Result<Vec<i64>, AppError> {
+    let checked = run_certificate_cycle(store).await?;
+    for recorded in &checked {
+        crate::alerter::handle_certificate_check(app, store, recorded).await;
+    }
+    Ok(checked.iter().map(|recorded| recorded.after.id).collect())
+}
+
+async fn run_uptime_tick(
+    app: &AppHandle,
+    store: &Arc<Store>,
+    client: &reqwest::Client,
+    config: &CheckConfig,
+) -> Result<Vec<i64>, AppError> {
+    let checked = run_cycle(store, client, config).await?;
+    for recorded in &checked {
+        crate::alerter::handle_check(app, store, recorded).await;
+    }
+    crate::alerter::process_still_down(app, store).await;
+    Ok(checked.iter().map(|recorded| recorded.after.id).collect())
+}
+
+async fn scheduler_loop<F, Fut>(app: AppHandle, scheduler: &'static str, mut cycle: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<i64>, AppError>>,
+{
+    let mut interval = tokio::time::interval(TICK_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        match cycle().await {
+            Ok(monitor_ids) if !monitor_ids.is_empty() => {
+                if let Err(error) =
+                    app.emit(CHECK_COMPLETED_EVENT, CheckCompletedPayload { monitor_ids })
+                {
+                    tracing::error!(scheduler, error = %error, "failed to emit check completion");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(scheduler, error = %error, "check cycle failed"),
+        }
+    }
+}
+
+/// Spawn the scheduler loops. They run for the lifetime of the app,
+/// independent of window visibility.
+pub fn start(app: AppHandle) {
+    let store = app.state::<Arc<Store>>().inner().clone();
+    let ctx = app.state::<checker::CheckContext>();
+    let client = ctx.client.clone();
+    let config = ctx.config;
+
+    let certificate_scheduler_app = app.clone();
+    let certificate_cycle_app = app.clone();
+    let certificate_store = store.clone();
+    tauri::async_runtime::spawn(scheduler_loop(
+        certificate_scheduler_app,
+        "certificate",
+        move || {
+            let app = certificate_cycle_app.clone();
+            let store = certificate_store.clone();
+            async move { run_certificate_tick(&app, &store).await }
+        },
+    ));
+
+    let uptime_cycle_app = app.clone();
+    tauri::async_runtime::spawn(scheduler_loop(app, "uptime", move || {
+        let app = uptime_cycle_app.clone();
+        let store = store.clone();
+        let client = client.clone();
+        async move { run_uptime_tick(&app, &store, &client, &config).await }
+    }));
 }
 
 #[cfg(test)]
@@ -206,10 +283,12 @@ mod tests {
             last_check_at: None,
             down_alert_sent_at: None,
             cert_check_enabled: false,
-            cert_status: "not_yet_checked".into(),
+            cert_status: crate::store::CertificateStatus::NotYetChecked,
             cert_expires_at: None,
             cert_issuer: None,
             cert_failure_reason: None,
+            cert_last_check_at: None,
+            cert_expiry_alert_sent_at: None,
             created_at: String::new(),
             updated_at: String::new(),
             last_response_time_ms: None,

@@ -62,6 +62,8 @@ export interface Monitor {
   certExpiresAt: string | null;
   certIssuer: string | null;
   certFailureReason: string | null;
+  certLastCheckAt: string | null;
+  certExpiryAlertSentAt: string | null;
   createdAt: string;
   updatedAt: string;
   /** Response time of the latest real check, if any. */
