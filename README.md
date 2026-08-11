@@ -35,6 +35,18 @@ Design rules:
 - **Secrets in Keychain** — the Slack webhook URL never lands in SQLite and is never sent to the frontend.
 - **Minimal Tauri capabilities** — no shell, no filesystem access from the frontend.
 
+## Alerting behavior
+
+| Event | Native notification | Slack |
+|---|---|---|
+| Monitor goes down after two consecutive failures | Sent | Sent when configured |
+| Monitor remains down for 60 minutes | Sent again every hour | Sent again every hour when configured |
+| Monitor recovers after a delivered down alert | Sent with downtime | Sent with downtime when configured |
+
+A recovery stays silent when the preceding failures never produced a down
+alert. Saving a Slack webhook sends a test message before the URL is stored in
+macOS Keychain; removing it leaves native alerts enabled.
+
 ## Stack
 
 | Layer | Choice |

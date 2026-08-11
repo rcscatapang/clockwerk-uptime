@@ -10,6 +10,7 @@ use crate::error::AppError;
 
 pub const SLACK_TIMEOUT: Duration = Duration::from_secs(5);
 pub const WEBHOOK_HOST: &str = "hooks.slack.com";
+pub const CONFIGURATION_TEST_MESSAGE: &str = "webhook configured";
 
 /// A webhook URL must be https on hooks.slack.com; anything else is rejected
 /// at entry time.
@@ -38,7 +39,7 @@ pub async fn send(webhook_url: &str, text: &str) -> Result<(), AppError> {
         .json(&payload(text))
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("slack delivery failed: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("slack delivery failed: {}", e.without_url())))?;
     if !response.status().is_success() {
         return Err(AppError::Internal(format!(
             "slack delivery failed: HTTP {}",
@@ -46,6 +47,10 @@ pub async fn send(webhook_url: &str, text: &str) -> Result<(), AppError> {
         )));
     }
     Ok(())
+}
+
+pub async fn verify(webhook_url: &str) -> Result<(), AppError> {
+    send(webhook_url, CONFIGURATION_TEST_MESSAGE).await
 }
 
 #[cfg(test)]
@@ -96,5 +101,28 @@ mod tests {
             then.status(404);
         });
         assert!(send(&server.url("/hook"), "x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn transport_errors_do_not_expose_the_webhook_url() {
+        let error = send("http://127.0.0.1:1/services/secret-token", "x")
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn verify_sends_configuration_message() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/hook")
+                .json_body(serde_json::json!({
+                    "text": CONFIGURATION_TEST_MESSAGE
+                }));
+            then.status(200);
+        });
+        verify(&server.url("/hook")).await.unwrap();
+        mock.assert();
     }
 }
