@@ -11,6 +11,7 @@
 //     an explicit `app.exit(..)` from the tray passes through.
 
 mod alerter;
+mod certificate;
 mod checker;
 mod engine;
 mod error;
@@ -87,13 +88,16 @@ async fn check_now(
 ) -> Result<Monitor, AppError> {
     let recorded = engine::check_one(store.inner(), &ctx.client, &ctx.config, id).await?;
     alerter::handle_check(&app, store.inner(), &recorded).await;
+    if let Some(certificate) = engine::check_certificate_one(store.inner(), id).await? {
+        alerter::handle_certificate_check(&app, store.inner(), &certificate).await;
+    }
     let _ = app.emit(
         engine::CHECK_COMPLETED_EVENT,
         engine::CheckCompletedPayload {
             monitor_ids: vec![id],
         },
     );
-    Ok(recorded.after)
+    store.get_monitor(id)
 }
 
 fn settings_with_secrets(store: &Store) -> Result<Settings, AppError> {

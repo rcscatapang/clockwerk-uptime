@@ -11,7 +11,11 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{
+    params,
+    types::{FromSql, FromSqlError, FromSqlResult, ValueRef},
+    Connection, OptionalExtension, Row,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
@@ -63,6 +67,11 @@ const MIGRATIONS: &[&str] = &[
       value TEXT NOT NULL
     );
     ",
+    // v2 — daily certificate scheduling and expiry-alert de-duplication.
+    "
+    ALTER TABLE monitors ADD COLUMN cert_last_check_at TEXT;
+    ALTER TABLE monitors ADD COLUMN cert_expiry_alert_sent_at TEXT;
+    ",
 ];
 
 /// The `monitors.uptime_status` values. Stored as text; the frontend types
@@ -71,6 +80,35 @@ pub mod uptime_status {
     pub const NOT_YET_CHECKED: &str = "not_yet_checked";
     pub const UP: &str = "up";
     pub const DOWN: &str = "down";
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificateStatus {
+    NotYetChecked,
+    Valid,
+    Invalid,
+}
+
+impl CertificateStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotYetChecked => "not_yet_checked",
+            Self::Valid => "valid",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+impl FromSql for CertificateStatus {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_str()? {
+            "not_yet_checked" => Ok(Self::NotYetChecked),
+            "valid" => Ok(Self::Valid),
+            "invalid" => Ok(Self::Invalid),
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
 }
 
 /// ISO-8601 UTC timestamp — the one time format stored in the DB.
@@ -119,10 +157,12 @@ pub struct Monitor {
     pub last_check_at: Option<String>,
     pub down_alert_sent_at: Option<String>,
     pub cert_check_enabled: bool,
-    pub cert_status: String,
+    pub cert_status: CertificateStatus,
     pub cert_expires_at: Option<String>,
     pub cert_issuer: Option<String>,
     pub cert_failure_reason: Option<String>,
+    pub cert_last_check_at: Option<String>,
+    pub cert_expiry_alert_sent_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// Latest real check's response time; derived, not a monitors column.
@@ -136,6 +176,18 @@ pub struct RecordedCheck {
     pub before: Monitor,
     pub after: Monitor,
     pub event: Option<crate::state::TransitionEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CertificateEvent {
+    BecameInvalid,
+    ExpiresSoon { days_remaining: i64 },
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordedCertificateCheck {
+    pub after: Monitor,
+    pub event: Option<CertificateEvent>,
 }
 
 #[allow(dead_code)]
@@ -221,8 +273,8 @@ fn resolve_cert_enabled(v: &ValidatedInput, fallback: bool) -> bool {
 
 fn validate(input: &MonitorInput) -> Result<ValidatedInput, AppError> {
     let raw_url = input.url.trim();
-    let parsed = url::Url::parse(raw_url)
-        .map_err(|e| AppError::InvalidUrl(format!("invalid URL: {e}")))?;
+    let parsed =
+        url::Url::parse(raw_url).map_err(|e| AppError::InvalidUrl(format!("invalid URL: {e}")))?;
     let is_https = match parsed.scheme() {
         "https" => true,
         "http" => false,
@@ -366,20 +418,29 @@ impl Store {
         let v = validate(input)?;
         self.with_conn(|conn| {
             let existing = get_monitor_inner(conn, id)?;
+            let cert_check_enabled = resolve_cert_enabled(&v, existing.cert_check_enabled);
+            let reset_certificate = cert_check_enabled
+                && (!existing.cert_check_enabled || existing.url != v.url);
             let changed = conn.execute(
                 "UPDATE monitors SET
                    url = ?1, uptime_check_enabled = ?2, check_interval_minutes = ?3,
                    check_method = ?4, look_for_string = ?5, cert_check_enabled = ?6,
-                   updated_at = ?7
-                 WHERE id = ?8",
+                   cert_status = CASE WHEN ?7 THEN 'not_yet_checked' ELSE cert_status END,
+                   cert_expires_at = CASE WHEN ?7 THEN NULL ELSE cert_expires_at END,
+                   cert_issuer = CASE WHEN ?7 THEN NULL ELSE cert_issuer END,
+                   cert_failure_reason = CASE WHEN ?7 THEN NULL ELSE cert_failure_reason END,
+                   cert_last_check_at = CASE WHEN ?7 THEN NULL ELSE cert_last_check_at END,
+                   cert_expiry_alert_sent_at = CASE WHEN ?7 THEN NULL ELSE cert_expiry_alert_sent_at END,
+                   updated_at = ?8
+                 WHERE id = ?9",
                 params![
                     v.url,
                     v.uptime_check_enabled,
                     v.check_interval_minutes,
                     v.check_method.as_str(),
                     v.look_for_string,
-                    // update: no explicit choice preserves the stored toggle
-                    resolve_cert_enabled(&v, existing.cert_check_enabled),
+                    cert_check_enabled,
+                    reset_certificate,
                     now_utc(),
                     id,
                 ],
@@ -522,6 +583,53 @@ impl Store {
         })
     }
 
+    pub fn record_certificate_check(
+        &self,
+        id: i64,
+        outcome: &crate::certificate::CertificateOutcome,
+    ) -> Result<Option<RecordedCertificateCheck>, AppError> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            let before = tx.query_row(
+                &format!("SELECT {MONITOR_COLUMNS} FROM monitors WHERE id = ?1"),
+                params![id],
+                monitor_from_row,
+            )?;
+            if !before.cert_check_enabled {
+                return Ok(None);
+            }
+            let now = now_utc();
+            let status = if outcome.valid {
+                CertificateStatus::Valid
+            } else {
+                CertificateStatus::Invalid
+            };
+            let event = certificate_event(&before, outcome, &now);
+            tx.execute(
+                "UPDATE monitors SET
+                   cert_status = ?1, cert_expires_at = ?2, cert_issuer = ?3,
+                   cert_failure_reason = ?4, cert_last_check_at = ?5,
+                   updated_at = ?5
+                 WHERE id = ?6",
+                params![
+                    status.as_str(),
+                    outcome.expires_at,
+                    outcome.issuer,
+                    outcome.failure_reason,
+                    now,
+                    id,
+                ],
+            )?;
+            let after = tx.query_row(
+                &format!("SELECT {MONITOR_COLUMNS} FROM monitors WHERE id = ?1"),
+                params![id],
+                monitor_from_row,
+            )?;
+            tx.commit()?;
+            Ok(Some(RecordedCertificateCheck { after, event }))
+        })
+    }
+
     /// Prevent a monitor transition from racing alert delivery/bookkeeping.
     /// The lock is global because alert volume is tiny and delivery is already
     /// sequential; keeping it here gives every check path the same ordering.
@@ -544,6 +652,28 @@ impl Store {
                  WHERE id = ?2 AND uptime_status = ?3
                    AND status_last_change_at IS ?4",
                 params![sent_at, id, expected_status, expected_status_changed_at],
+            )?;
+            Ok(changed == 1)
+        })
+    }
+
+    pub fn set_cert_expiry_alert_sent_at_if_current(
+        &self,
+        id: i64,
+        expected_status: CertificateStatus,
+        expected_last_check_at: &str,
+        sent_at: &str,
+    ) -> Result<bool, AppError> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE monitors SET cert_expiry_alert_sent_at = ?1
+                 WHERE id = ?2 AND cert_status = ?3 AND cert_last_check_at = ?4",
+                params![
+                    sent_at,
+                    id,
+                    expected_status.as_str(),
+                    expected_last_check_at
+                ],
             )?;
             Ok(changed == 1)
         })
@@ -574,7 +704,11 @@ impl Store {
             conn.execute(
                 "INSERT INTO settings (key, value) VALUES ('autostart_enabled', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![if settings.autostart_enabled { "true" } else { "false" }],
+                params![if settings.autostart_enabled {
+                    "true"
+                } else {
+                    "false"
+                }],
             )?;
             Ok(())
         })
@@ -592,7 +726,8 @@ const MONITOR_COLUMNS: &str = "id, url, uptime_check_enabled, check_interval_min
      check_method, look_for_string, uptime_status, uptime_failure_reason, \
      consecutive_failures, status_last_change_at, last_check_at, down_alert_sent_at, \
      cert_check_enabled, cert_status, cert_expires_at, cert_issuer, \
-     cert_failure_reason, created_at, updated_at, \
+     cert_failure_reason, cert_last_check_at, cert_expiry_alert_sent_at, \
+     created_at, updated_at, \
      (SELECT response_time_ms FROM check_results c \
         WHERE c.monitor_id = monitors.id AND c.status != 'gap' \
         ORDER BY c.checked_at DESC, c.id DESC LIMIT 1) AS last_response_time_ms";
@@ -625,10 +760,42 @@ fn monitor_from_row(row: &Row) -> Result<Monitor, rusqlite::Error> {
         cert_expires_at: row.get(14)?,
         cert_issuer: row.get(15)?,
         cert_failure_reason: row.get(16)?,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
-        last_response_time_ms: row.get(19)?,
+        cert_last_check_at: row.get(17)?,
+        cert_expiry_alert_sent_at: row.get(18)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
+        last_response_time_ms: row.get(21)?,
     })
+}
+
+fn certificate_event(
+    before: &Monitor,
+    outcome: &crate::certificate::CertificateOutcome,
+    checked_at: &str,
+) -> Option<CertificateEvent> {
+    if !outcome.valid {
+        return (before.cert_status != CertificateStatus::Invalid)
+            .then_some(CertificateEvent::BecameInvalid);
+    }
+    let expires_at = outcome
+        .expires_at
+        .as_deref()
+        .and_then(history::parse_timestamp)?;
+    let checked_at = history::parse_timestamp(checked_at)?;
+    let seconds_remaining = expires_at.signed_duration_since(checked_at).num_seconds();
+    if seconds_remaining < 0 {
+        return None;
+    }
+    let days_remaining = (seconds_remaining + 86_399) / 86_400;
+    if !(0..=crate::certificate::EXPIRY_WARNING_DAYS).contains(&days_remaining) {
+        return None;
+    }
+    let already_alerted_today = before
+        .cert_expiry_alert_sent_at
+        .as_deref()
+        .and_then(history::parse_timestamp)
+        .is_some_and(|sent_at| checked_at.signed_duration_since(sent_at) < Duration::hours(24));
+    (!already_alerted_today).then_some(CertificateEvent::ExpiresSoon { days_remaining })
 }
 
 fn load_history_events(
@@ -681,7 +848,10 @@ fn history_event_from_values(
     Ok(HistoryEvent {
         checked_at,
         status: HistoryStatus::from_db(&values.1).ok_or_else(|| {
-            AppError::Db(format!("invalid check status stored for history: {}", values.1))
+            AppError::Db(format!(
+                "invalid check status stored for history: {}",
+                values.1
+            ))
         })?,
         response_time_ms: values.2,
         failure_reason: values.3,
@@ -832,6 +1002,40 @@ mod tests {
     }
 
     #[test]
+    fn enabling_or_retargeting_certificate_checks_resets_stale_metadata() {
+        let store = Store::open_in_memory().unwrap();
+        let monitor = store.create_monitor(&input("https://a.example")).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE monitors SET cert_status = 'valid', cert_last_check_at = ?1,
+                     cert_expires_at = ?2, cert_issuer = 'issuer'
+                     WHERE id = ?3",
+                    params![now_utc(), now_utc(), monitor.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut disabled = input("https://a.example");
+        disabled.cert_check_enabled = Some(false);
+        store.update_monitor(monitor.id, &disabled).unwrap();
+
+        let mut enabled_input = input("https://a.example");
+        enabled_input.cert_check_enabled = Some(true);
+        let enabled = store.update_monitor(monitor.id, &enabled_input).unwrap();
+        assert!(enabled.cert_check_enabled);
+        assert_eq!(enabled.cert_status, CertificateStatus::NotYetChecked);
+        assert!(enabled.cert_last_check_at.is_none());
+        assert!(enabled.cert_expires_at.is_none());
+
+        let retargeted = store
+            .update_monitor(monitor.id, &input("https://b.example"))
+            .unwrap();
+        assert_eq!(retargeted.cert_status, CertificateStatus::NotYetChecked);
+        assert!(retargeted.cert_last_check_at.is_none());
+    }
+
+    #[test]
     fn update_without_cert_choice_preserves_stored_toggle() {
         let store = Store::open_in_memory().unwrap();
         let mut off = input("https://a.example");
@@ -840,7 +1044,9 @@ mod tests {
         assert!(!m.cert_check_enabled);
 
         // No explicit choice on update → stored value survives.
-        let updated = store.update_monitor(m.id, &input("https://a.example")).unwrap();
+        let updated = store
+            .update_monitor(m.id, &input("https://a.example"))
+            .unwrap();
         assert!(!updated.cert_check_enabled);
 
         // Explicit choice on update is honored.
@@ -850,7 +1056,12 @@ mod tests {
 
         // Switching to http forces it off.
         let http = input("http://a.example");
-        assert!(!store.update_monitor(m.id, &http).unwrap().cert_check_enabled);
+        assert!(
+            !store
+                .update_monitor(m.id, &http)
+                .unwrap()
+                .cert_check_enabled
+        );
     }
 
     #[test]
@@ -865,7 +1076,16 @@ mod tests {
                 Ok(v.collect::<Result<Vec<_>, _>>()?)
             })
             .unwrap();
-        assert_eq!(versions, vec![1]);
+        assert_eq!(versions, vec![1, 2]);
+        let certificate_columns = store
+            .with_conn(|conn| {
+                let mut statement = conn.prepare("PRAGMA table_info(monitors)")?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        assert!(certificate_columns.contains(&"cert_last_check_at".into()));
+        assert!(certificate_columns.contains(&"cert_expiry_alert_sent_at".into()));
         // Still fully usable afterwards.
         store.create_monitor(&input("https://example.com")).unwrap();
     }
@@ -995,7 +1215,8 @@ mod tests {
                     )?;
                     for index in 0..100_000_i64 {
                         let checked_at = start + Duration::milliseconds(index * 25_920);
-                        statement.execute(params![monitor.id, history::format_timestamp(checked_at)])?;
+                        statement
+                            .execute(params![monitor.id, history::format_timestamp(checked_at)])?;
                     }
                 }
                 tx.commit()?;
@@ -1057,5 +1278,77 @@ mod tests {
         }
 
         assert!(started.elapsed() < StdDuration::from_secs(1));
+    }
+
+    #[test]
+    fn certificate_alert_events_are_deduplicated() {
+        let store = Store::open_in_memory().unwrap();
+        let monitor = store.create_monitor(&input("https://example.com")).unwrap();
+        let invalid = crate::certificate::CertificateOutcome {
+            valid: false,
+            expires_at: None,
+            issuer: None,
+            failure_reason: Some("self-signed certificate".into()),
+        };
+
+        let first = store
+            .record_certificate_check(monitor.id, &invalid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.event, Some(CertificateEvent::BecameInvalid));
+        let repeat = store
+            .record_certificate_check(monitor.id, &invalid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeat.event, None);
+
+        let far_future = crate::certificate::CertificateOutcome {
+            valid: true,
+            expires_at: Some((Utc::now() + Duration::days(30)).to_rfc3339()),
+            issuer: Some("issuer".into()),
+            failure_reason: None,
+        };
+        store
+            .record_certificate_check(monitor.id, &far_future)
+            .unwrap();
+        let invalid_again = store
+            .record_certificate_check(monitor.id, &invalid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(invalid_again.event, Some(CertificateEvent::BecameInvalid));
+    }
+
+    #[test]
+    fn expiry_alert_fires_at_most_once_per_day() {
+        let store = Store::open_in_memory().unwrap();
+        let monitor = store.create_monitor(&input("https://example.com")).unwrap();
+        let expiring = crate::certificate::CertificateOutcome {
+            valid: true,
+            expires_at: Some((Utc::now() + Duration::days(9)).to_rfc3339()),
+            issuer: Some("issuer".into()),
+            failure_reason: None,
+        };
+        let first = store
+            .record_certificate_check(monitor.id, &expiring)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            first.event,
+            Some(CertificateEvent::ExpiresSoon { days_remaining: 9 })
+        ));
+        store
+            .set_cert_expiry_alert_sent_at_if_current(
+                monitor.id,
+                CertificateStatus::Valid,
+                first.after.cert_last_check_at.as_deref().unwrap(),
+                &now_utc(),
+            )
+            .unwrap();
+
+        let repeated = store
+            .record_certificate_check(monitor.id, &expiring)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.event, None);
     }
 }
