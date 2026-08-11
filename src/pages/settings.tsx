@@ -53,9 +53,22 @@ export function SettingsPage() {
                   autostartEnabled: checked,
                   slackWebhookConfigured:
                     settings.data?.slackWebhookConfigured ?? false,
+                  historyRetentionDays:
+                    settings.data?.historyRetentionDays ?? 90,
+                  lastPruneAt: settings.data?.lastPruneAt ?? null,
                 })
               }
             />
+          </div>
+          <div className="mt-4 border-t pt-4">
+            <p className="text-sm font-medium">
+              History retention: {settings.data?.historyRetentionDays ?? 90} days
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Last pruned: {settings.data?.lastPruneAt
+                ? new Date(settings.data.lastPruneAt).toLocaleString()
+                : "Not yet pruned"}
+            </p>
           </div>
           <div className="mt-4 border-t pt-4">
             <p className="text-sm font-medium">Native notifications</p>

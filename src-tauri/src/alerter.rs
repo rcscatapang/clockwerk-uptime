@@ -161,8 +161,12 @@ pub fn decide_after_check(recorded: &RecordedCheck, now: DateTime<Utc>) -> Optio
         TransitionEvent::Recovered => {
             // Silent recovery unless a down alert actually went out.
             recorded.before.down_alert_sent_at.as_ref()?;
-            let downtime =
-                human_duration_between(recorded.before.status_last_change_at.as_deref(), now);
+            let downtime = recorded
+                .observed_downtime_seconds
+                .map(human_duration_seconds)
+                .unwrap_or_else(|| {
+                    human_duration_between(recorded.before.status_last_change_at.as_deref(), now)
+                });
             Some(Alert {
                 monitor_id: recorded.after.id,
                 title: "Monitor recovered".into(),
@@ -286,6 +290,14 @@ pub fn human_duration_between(start: Option<&str>, end: DateTime<Utc>) -> String
         .signed_duration_since(start.with_timezone(&Utc))
         .num_minutes()
         .max(0);
+    human_duration_minutes(minutes)
+}
+
+fn human_duration_seconds(seconds: i64) -> String {
+    human_duration_minutes(seconds.max(0) / 60)
+}
+
+fn human_duration_minutes(minutes: i64) -> String {
     match minutes {
         0 => "less than a minute".into(),
         1..=59 => format!("{minutes} min"),
@@ -383,8 +395,21 @@ pub async fn process_still_down(app: &AppHandle, store: &Arc<Store>) {
             return;
         }
     };
+    let post_gap_suppressed = match store.post_gap_suppressed_monitor_ids() {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!(error = %error, "post-gap alert scan failed");
+            return;
+        }
+    };
     let now = Utc::now();
     for monitor in monitors {
+        if monitor.uptime_status != uptime_status::DOWN {
+            continue;
+        }
+        if post_gap_suppressed.contains(&monitor.id) {
+            continue;
+        }
         if let Some(alert) = decide_still_down(&monitor, now) {
             dispatch(app, store, alert).await;
         }
@@ -428,6 +453,7 @@ mod tests {
             before,
             after,
             event,
+            observed_downtime_seconds: None,
         }
     }
 

@@ -35,6 +35,8 @@ use crate::store::{uptime_status, Monitor, RecordedCertificateCheck, RecordedChe
 
 pub const TICK_INTERVAL: Duration = Duration::from_secs(30);
 pub const MAX_IN_FLIGHT: usize = 10;
+const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const RETENTION_BATCH_SIZE: usize = 5_000;
 
 /// Event name the frontend listens for after each completed cycle.
 pub const CHECK_COMPLETED_EVENT: &str = "check-completed";
@@ -43,6 +45,11 @@ pub const CHECK_COMPLETED_EVENT: &str = "check-completed";
 #[serde(rename_all = "camelCase")]
 pub struct CheckCompletedPayload {
     pub monitor_ids: Vec<i64>,
+}
+
+enum SchedulerOutcome {
+    Checked(Vec<i64>),
+    Complete,
 }
 
 pub fn is_due(monitor: &Monitor, now: DateTime<Utc>) -> bool {
@@ -197,24 +204,47 @@ async fn run_uptime_tick(
     Ok(checked.iter().map(|recorded| recorded.after.id).collect())
 }
 
-async fn scheduler_loop<F, Fut>(app: AppHandle, scheduler: &'static str, mut cycle: F)
-where
+pub async fn run_retention_cycle_at(
+    store: &Arc<Store>,
+    now: DateTime<Utc>,
+) -> Result<usize, AppError> {
+    let cutoff = now - chrono::Duration::days(crate::store::HISTORY_RETENTION_DAYS);
+    let mut deleted = 0;
+    loop {
+        let batch = store.prune_history_batch_before(cutoff, RETENTION_BATCH_SIZE)?;
+        deleted += batch;
+        if batch < RETENTION_BATCH_SIZE {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    store.set_last_prune_at(&crate::history::format_timestamp(now))?;
+    tracing::info!(deleted, "history retention prune complete");
+    Ok(deleted)
+}
+
+async fn scheduler_loop<F, Fut>(
+    app: AppHandle,
+    scheduler: &'static str,
+    cadence: Duration,
+    mut cycle: F,
+) where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<Vec<i64>, AppError>>,
+    Fut: Future<Output = Result<SchedulerOutcome, AppError>>,
 {
-    let mut interval = tokio::time::interval(TICK_INTERVAL);
+    let mut interval = tokio::time::interval(cadence);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
         match cycle().await {
-            Ok(monitor_ids) if !monitor_ids.is_empty() => {
+            Ok(SchedulerOutcome::Checked(monitor_ids)) if !monitor_ids.is_empty() => {
                 if let Err(error) =
                     app.emit(CHECK_COMPLETED_EVENT, CheckCompletedPayload { monitor_ids })
                 {
                     tracing::error!(scheduler, error = %error, "failed to emit check completion");
                 }
             }
-            Ok(_) => {}
+            Ok(SchedulerOutcome::Checked(_) | SchedulerOutcome::Complete) => {}
             Err(error) => tracing::error!(scheduler, error = %error, "check cycle failed"),
         }
     }
@@ -234,26 +264,57 @@ pub fn start(app: AppHandle) {
     tauri::async_runtime::spawn(scheduler_loop(
         certificate_scheduler_app,
         "certificate",
+        TICK_INTERVAL,
         move || {
             let app = certificate_cycle_app.clone();
             let store = certificate_store.clone();
-            async move { run_certificate_tick(&app, &store).await }
+            async move {
+                run_certificate_tick(&app, &store)
+                    .await
+                    .map(SchedulerOutcome::Checked)
+            }
         },
     ));
 
+    let uptime_scheduler_app = app.clone();
     let uptime_cycle_app = app.clone();
-    tauri::async_runtime::spawn(scheduler_loop(app, "uptime", move || {
-        let app = uptime_cycle_app.clone();
-        let store = store.clone();
-        let client = client.clone();
-        async move { run_uptime_tick(&app, &store, &client, &config).await }
-    }));
+    let uptime_store = store.clone();
+    tauri::async_runtime::spawn(scheduler_loop(
+        uptime_scheduler_app,
+        "uptime",
+        TICK_INTERVAL,
+        move || {
+            let app = uptime_cycle_app.clone();
+            let store = uptime_store.clone();
+            let client = client.clone();
+            async move {
+                run_uptime_tick(&app, &store, &client, &config)
+                    .await
+                    .map(SchedulerOutcome::Checked)
+            }
+        },
+    ));
+
+    let retention_store = store;
+    tauri::async_runtime::spawn(scheduler_loop(
+        app,
+        "retention",
+        RETENTION_INTERVAL,
+        move || {
+            let store = retention_store.clone();
+            async move {
+                run_retention_cycle_at(&store, Utc::now()).await?;
+                Ok(SchedulerOutcome::Complete)
+            }
+        },
+    ));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::{CheckMethod, MonitorInput};
+    use chrono::TimeZone;
     use httpmock::prelude::*;
     use std::time::Instant;
 
@@ -331,6 +392,18 @@ mod tests {
             &monitor_due_probe(|m| m.last_check_at = Some(stale.clone())),
             now
         ));
+    }
+
+    #[tokio::test]
+    async fn retention_cycle_records_its_completion() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 12, 0, 0).unwrap();
+
+        assert_eq!(run_retention_cycle_at(&store, now).await.unwrap(), 0);
+        assert_eq!(
+            store.get_settings().unwrap().last_prune_at.as_deref(),
+            Some(crate::history::format_timestamp(now).as_str())
+        );
     }
 
     #[tokio::test]
