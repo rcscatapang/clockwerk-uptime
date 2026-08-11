@@ -9,7 +9,6 @@ import { Switch } from "@/components/ui/switch";
 import {
   useSetSlackWebhook,
   useSettings,
-  useSlackWebhookStatus,
   useUpdateSettings,
 } from "@/lib/queries";
 
@@ -17,7 +16,6 @@ export function SettingsPage() {
   const [webhookUrl, setWebhookUrl] = useState("");
   const settings = useSettings();
   const updateSettings = useUpdateSettings();
-  const slackStatus = useSlackWebhookStatus();
   const setSlackWebhook = useSetSlackWebhook({
     onSuccess: () => setWebhookUrl(""),
   });
@@ -51,7 +49,11 @@ export function SettingsPage() {
               checked={settings.data?.autostartEnabled ?? false}
               disabled={settings.isPending || updateSettings.isPending}
               onCheckedChange={(checked) =>
-                updateSettings.mutate({ autostartEnabled: checked })
+                updateSettings.mutate({
+                  autostartEnabled: checked,
+                  slackWebhookConfigured:
+                    settings.data?.slackWebhookConfigured ?? false,
+                })
               }
             />
           </div>
@@ -61,9 +63,9 @@ export function SettingsPage() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             Slack alerts
-            {!slackStatus.isPending && !slackStatus.isError && (
-              <Badge variant={slackStatus.data?.configured ? "default" : "secondary"}>
-                {slackStatus.data?.configured ? "Configured" : "Not configured"}
+            {!settings.isPending && !settings.isError && (
+              <Badge variant={settings.data?.slackWebhookConfigured ? "default" : "secondary"}>
+                {settings.data?.slackWebhookConfigured ? "Configured" : "Not configured"}
               </Badge>
             )}
           </CardTitle>
@@ -74,11 +76,6 @@ export function SettingsPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {slackStatus.isError && (
-            <p className="text-sm text-destructive">
-              Could not read the Slack configuration. {String(slackStatus.error)}
-            </p>
-          )}
           <form className="space-y-3" onSubmit={saveWebhook}>
             <div className="space-y-2">
               <Label htmlFor="slack-webhook">Slack webhook URL</Label>
@@ -92,7 +89,7 @@ export function SettingsPage() {
                 onChange={(event) => setWebhookUrl(event.target.value)}
               />
               <p className="text-xs text-muted-foreground">
-                Saving sends a test message before replacing the stored webhook.
+                Saving replaces the Keychain value without displaying it again.
               </p>
             </div>
             <div className="flex gap-2">
@@ -100,9 +97,9 @@ export function SettingsPage() {
                 type="submit"
                 disabled={setSlackWebhook.isPending || webhookUrl.trim() === ""}
               >
-                {setSlackWebhook.isPending ? "Testing…" : "Save webhook"}
+                {setSlackWebhook.isPending ? "Saving…" : "Save webhook"}
               </Button>
-              {slackStatus.data?.configured && (
+              {settings.data?.slackWebhookConfigured && (
                 <Button
                   type="button"
                   variant="outline"

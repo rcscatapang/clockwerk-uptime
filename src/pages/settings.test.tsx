@@ -11,19 +11,16 @@ vi.mock("@/lib/tauri", async () => {
   return {
     ...actual,
     getSettings: vi.fn(),
-    getSlackWebhookStatus: vi.fn(),
     setSlackWebhook: vi.fn(),
   };
 });
 
 import {
   getSettings,
-  getSlackWebhookStatus,
   setSlackWebhook,
 } from "@/lib/tauri";
 
 const getSettingsMock = vi.mocked(getSettings);
-const getSlackWebhookStatusMock = vi.mocked(getSlackWebhookStatus);
 const setSlackWebhookMock = vi.mocked(setSlackWebhook);
 
 function renderSettings() {
@@ -39,15 +36,19 @@ function renderSettings() {
 
 beforeEach(() => {
   getSettingsMock.mockReset();
-  getSlackWebhookStatusMock.mockReset();
   setSlackWebhookMock.mockReset();
-  getSettingsMock.mockResolvedValue({ autostartEnabled: false });
-  getSlackWebhookStatusMock.mockResolvedValue({ configured: false });
+  getSettingsMock.mockResolvedValue({
+    autostartEnabled: false,
+    slackWebhookConfigured: false,
+  });
 });
 
 describe("SettingsPage alerting", () => {
   it("shows Slack configuration without exposing the stored webhook", async () => {
-    getSlackWebhookStatusMock.mockResolvedValue({ configured: true });
+    getSettingsMock.mockResolvedValue({
+      autostartEnabled: false,
+      slackWebhookConfigured: true,
+    });
     renderSettings();
 
     expect(await screen.findByText("Configured")).toBeInTheDocument();
@@ -56,7 +57,14 @@ describe("SettingsPage alerting", () => {
 
   it("validates and stores a replacement webhook", async () => {
     const user = userEvent.setup();
-    setSlackWebhookMock.mockResolvedValue({ configured: true });
+    setSlackWebhookMock.mockResolvedValue({
+      autostartEnabled: false,
+      slackWebhookConfigured: true,
+    });
+    getSettingsMock.mockResolvedValue({
+      autostartEnabled: false,
+      slackWebhookConfigured: true,
+    });
     renderSettings();
 
     const input = screen.getByLabelText("Slack webhook URL");
@@ -73,8 +81,19 @@ describe("SettingsPage alerting", () => {
 
   it("can clear a configured webhook", async () => {
     const user = userEvent.setup();
-    getSlackWebhookStatusMock.mockResolvedValue({ configured: true });
-    setSlackWebhookMock.mockResolvedValue({ configured: false });
+    getSettingsMock
+      .mockResolvedValueOnce({
+        autostartEnabled: false,
+        slackWebhookConfigured: true,
+      })
+      .mockResolvedValue({
+        autostartEnabled: false,
+        slackWebhookConfigured: false,
+      });
+    setSlackWebhookMock.mockResolvedValue({
+      autostartEnabled: false,
+      slackWebhookConfigured: false,
+    });
     renderSettings();
 
     await screen.findByText("Configured");
