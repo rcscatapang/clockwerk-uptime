@@ -64,6 +64,8 @@ export interface Monitor {
   certFailureReason: string | null;
   createdAt: string;
   updatedAt: string;
+  /** Response time of the latest real check, if any. */
+  lastResponseTimeMs: number | null;
 }
 
 export interface MonitorInput {
@@ -98,6 +100,10 @@ export function updateMonitor(id: number, input: MonitorInput): Promise<Monitor>
 
 export function deleteMonitor(id: number): Promise<void> {
   return invoke<void>("delete_monitor", { id });
+}
+
+export function checkNow(id: number): Promise<Monitor> {
+  return invoke<Monitor>("check_now", { id });
 }
 
 export function getSettings(): Promise<Settings> {
