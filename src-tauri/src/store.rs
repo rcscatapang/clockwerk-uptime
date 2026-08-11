@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 use crate::error::AppError;
 
@@ -125,7 +126,15 @@ pub struct Monitor {
     pub last_response_time_ms: Option<i64>,
 }
 
-// Not constructed yet; the check engine will produce these rows.
+/// Everything one recorded check produced: the monitor row before and after,
+/// and the state transition that fired, if any.
+#[derive(Debug, Clone)]
+pub struct RecordedCheck {
+    pub before: Monitor,
+    pub after: Monitor,
+    pub event: Option<crate::state::TransitionEvent>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -172,12 +181,15 @@ fn default_true() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub autostart_enabled: bool,
+    #[serde(default)]
+    pub slack_webhook_configured: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             autostart_enabled: false,
+            slack_webhook_configured: false,
         }
     }
 }
@@ -244,6 +256,7 @@ fn validate(input: &MonitorInput) -> Result<ValidatedInput, AppError> {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    alerting: AsyncMutex<()>,
 }
 
 impl Store {
@@ -262,6 +275,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let store = Store {
             conn: Mutex::new(conn),
+            alerting: AsyncMutex::new(()),
         };
         store.migrate()?;
         Ok(store)
@@ -389,12 +403,12 @@ impl Store {
 
     /// Apply one check outcome atomically: read the monitor, run the state
     /// machine, update the monitor row, insert the `check_results` row.
-    /// Returns the updated monitor and the transition that fired, if any.
-    pub fn record_check(
+    pub async fn record_check(
         &self,
         id: i64,
         outcome: &crate::checker::CheckOutcome,
-    ) -> Result<(Monitor, Option<crate::state::TransitionEvent>), AppError> {
+    ) -> Result<RecordedCheck, AppError> {
+        let _alerting = self.alerting.lock().await;
         self.with_conn(|conn| {
             let tx = conn.transaction()?;
             let monitor = tx.query_row(
@@ -441,7 +455,38 @@ impl Store {
                 monitor_from_row,
             )?;
             tx.commit()?;
-            Ok((updated, change.event))
+            Ok(RecordedCheck {
+                before: monitor,
+                after: updated,
+                event: change.event,
+            })
+        })
+    }
+
+    /// Prevent a monitor transition from racing alert delivery/bookkeeping.
+    /// The lock is global because alert volume is tiny and delivery is already
+    /// sequential; keeping it here gives every check path the same ordering.
+    pub async fn lock_alerting(&self) -> AsyncMutexGuard<'_, ()> {
+        self.alerting.lock().await
+    }
+
+    /// Update alert bookkeeping only while the monitor is still in the state
+    /// that caused the alert. Returns false when the alert became stale.
+    pub fn set_down_alert_sent_at_if_status(
+        &self,
+        id: i64,
+        expected_status: &str,
+        expected_status_changed_at: Option<&str>,
+        sent_at: Option<&str>,
+    ) -> Result<bool, AppError> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE monitors SET down_alert_sent_at = ?1
+                 WHERE id = ?2 AND uptime_status = ?3
+                   AND status_last_change_at IS ?4",
+                params![sent_at, id, expected_status, expected_status_changed_at],
+            )?;
+            Ok(changed == 1)
         })
     }
 
@@ -458,6 +503,9 @@ impl Store {
                 .optional()?;
             Ok(Settings {
                 autostart_enabled: autostart.as_deref() == Some("true"),
+                // Enriched by the command layer from Keychain. The SQLite
+                // store deliberately has no access to secrets.
+                slack_webhook_configured: false,
             })
         })
     }
@@ -697,6 +745,7 @@ mod tests {
         store
             .save_settings(&Settings {
                 autostart_enabled: true,
+                slack_webhook_configured: false,
             })
             .unwrap();
         assert!(store.get_settings().unwrap().autostart_enabled);

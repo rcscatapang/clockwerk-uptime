@@ -10,9 +10,12 @@
 //     last window being destroyed) is vetoed so the process never dies silently;
 //     an explicit `app.exit(..)` from the tray passes through.
 
+mod alerter;
 mod checker;
 mod engine;
 mod error;
+mod secrets;
+mod slack;
 mod state;
 mod store;
 
@@ -66,19 +69,44 @@ async fn check_now(
     ctx: State<'_, CheckContext>,
     id: i64,
 ) -> Result<Monitor, AppError> {
-    let monitor = engine::check_one(store.inner(), &ctx.client, &ctx.config, id).await?;
+    let recorded = engine::check_one(store.inner(), &ctx.client, &ctx.config, id).await?;
+    alerter::handle_check(&app, store.inner(), &recorded).await;
     let _ = app.emit(
         engine::CHECK_COMPLETED_EVENT,
         engine::CheckCompletedPayload {
             monitor_ids: vec![id],
         },
     );
-    Ok(monitor)
+    Ok(recorded.after)
+}
+
+fn settings_with_secrets(store: &Store) -> Result<Settings, AppError> {
+    let mut settings = store.get_settings()?;
+    settings.slack_webhook_configured = secrets::get_slack_webhook()?.is_some();
+    Ok(settings)
+}
+
+/// Verify and store the Slack webhook, or remove it when the value is empty,
+/// without ever returning the secret.
+#[tauri::command]
+async fn set_slack_webhook(
+    store: State<'_, Arc<Store>>,
+    url: String,
+) -> Result<Settings, AppError> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        secrets::delete_slack_webhook()?;
+        return settings_with_secrets(store.inner());
+    }
+    slack::validate_webhook_url(&url)?;
+    slack::verify(&url).await?;
+    secrets::set_slack_webhook(&url)?;
+    settings_with_secrets(store.inner())
 }
 
 #[tauri::command]
 fn get_settings(store: State<Arc<Store>>) -> Result<Settings, AppError> {
-    store.get_settings()
+    settings_with_secrets(store.inner())
 }
 
 /// Persists settings in SQLite and applies side effects (autostart registration).
@@ -105,7 +133,7 @@ fn update_settings(
         let _ = apply(!settings.autostart_enabled);
         return Err(e);
     }
-    store.get_settings()
+    settings_with_secrets(store.inner())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -119,6 +147,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             list_monitors,
             get_monitor,
@@ -126,6 +155,7 @@ pub fn run() {
             update_monitor,
             delete_monitor,
             check_now,
+            set_slack_webhook,
             get_settings,
             update_settings
         ])
