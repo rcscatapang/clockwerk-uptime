@@ -83,6 +83,39 @@ export interface Settings {
   slackWebhookConfigured: boolean;
 }
 
+export type HistoryRange = "24h" | "7d" | "30d";
+export type HistoryStatus = "up" | "down" | "gap" | "mixed";
+
+export interface UptimeStats {
+  uptime24h: number | null;
+  uptime7d: number | null;
+  uptime30d: number | null;
+  avgResponseTimeMs24h: number | null;
+  lastCheckAt: string | null;
+  currentStatus: UptimeStatus;
+}
+
+export interface HistoryPoint {
+  startedAt: string;
+  endedAt: string;
+  status: HistoryStatus;
+  avgResponseTimeMs: number | null;
+}
+
+export interface Incident {
+  startedAt: string;
+  endedAt: string | null;
+  durationSeconds: number;
+  failureReason: string | null;
+  ongoing: boolean;
+  includesGap: boolean;
+}
+
+export interface HistoryResponse {
+  points: HistoryPoint[];
+  incidents: Incident[];
+}
+
 export function listMonitors(): Promise<Monitor[]> {
   return invoke<Monitor[]>("list_monitors");
 }
@@ -105,6 +138,17 @@ export function deleteMonitor(id: number): Promise<void> {
 
 export function checkNow(id: number): Promise<Monitor> {
   return invoke<Monitor>("check_now", { id });
+}
+
+export function getUptimeStats(monitorId: number): Promise<UptimeStats> {
+  return invoke<UptimeStats>("get_uptime_stats", { monitorId });
+}
+
+export function getHistory(
+  monitorId: number,
+  range: HistoryRange,
+): Promise<HistoryResponse> {
+  return invoke<HistoryResponse>("get_history", { monitorId, range });
 }
 
 export function getSettings(): Promise<Settings> {

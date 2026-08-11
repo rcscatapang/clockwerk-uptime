@@ -10,12 +10,15 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 use crate::error::AppError;
+use crate::history::{
+    self, HistoryEvent, HistoryRange, HistoryResponse, HistoryStatus, MonitorStatus, UptimeStats,
+};
 
 /// Ordered, append-only migration list. `schema_migrations` records which
 /// versions have been applied; each entry runs at most once, in a transaction.
@@ -399,6 +402,62 @@ impl Store {
         })
     }
 
+    // --- history -----------------------------------------------------------
+
+    pub fn get_uptime_stats(&self, id: i64) -> Result<UptimeStats, AppError> {
+        self.get_uptime_stats_at(id, Utc::now())
+    }
+
+    fn get_uptime_stats_at(&self, id: i64, now: DateTime<Utc>) -> Result<UptimeStats, AppError> {
+        self.with_conn(|conn| {
+            let monitor = get_monitor_inner(conn, id)?;
+            let events = load_history_events(conn, id, now - Duration::days(30), now)?;
+            let status = monitor_status(&monitor)?;
+            Ok(history::uptime_stats(
+                &events,
+                status,
+                monitor.last_check_at,
+                now,
+            ))
+        })
+    }
+
+    pub fn get_history(&self, id: i64, range: HistoryRange) -> Result<HistoryResponse, AppError> {
+        self.get_history_at(id, range, Utc::now())
+    }
+
+    fn get_history_at(
+        &self,
+        id: i64,
+        range: HistoryRange,
+        now: DateTime<Utc>,
+    ) -> Result<HistoryResponse, AppError> {
+        self.with_conn(|conn| {
+            let monitor = get_monitor_inner(conn, id)?;
+            let start = now - range.duration();
+            let incident_boundary: Option<String> = conn
+                .query_row(
+                    "SELECT checked_at FROM check_results
+                     WHERE monitor_id = ?1 AND checked_at < ?2 AND status != 'down'
+                     ORDER BY checked_at DESC, id DESC LIMIT 1",
+                    params![id, history::format_timestamp(start)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let load_from = incident_boundary
+                .as_deref()
+                .and_then(history::parse_timestamp)
+                .unwrap_or(start);
+            let events = load_history_events(conn, id, load_from, now)?;
+            Ok(history::history(
+                &events,
+                monitor_status(&monitor)?,
+                range,
+                now,
+            ))
+        })
+    }
+
     // --- check recording ----------------------------------------------------
 
     /// Apply one check outcome atomically: read the monitor, run the state
@@ -572,9 +631,77 @@ fn monitor_from_row(row: &Row) -> Result<Monitor, rusqlite::Error> {
     })
 }
 
+fn load_history_events(
+    conn: &Connection,
+    monitor_id: i64,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<HistoryEvent>, AppError> {
+    let start_text = history::format_timestamp(start);
+    let end_text = history::format_timestamp(end);
+    let predecessor: Option<(String, String, Option<i64>, Option<String>)> = conn
+        .query_row(
+            "SELECT checked_at, status, response_time_ms, failure_reason
+             FROM check_results
+             WHERE monitor_id = ?1 AND checked_at < ?2
+             ORDER BY checked_at DESC, id DESC LIMIT 1",
+            params![monitor_id, start_text],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let mut events = predecessor
+        .map(history_event_from_values)
+        .transpose()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut statement = conn.prepare(
+        "SELECT checked_at, status, response_time_ms, failure_reason
+         FROM check_results
+         WHERE monitor_id = ?1 AND checked_at >= ?2 AND checked_at < ?3
+         ORDER BY checked_at, id",
+    )?;
+    let rows = statement.query_map(params![monitor_id, start_text, end_text], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    })?;
+    for row in rows {
+        events.push(history_event_from_values(row?)?);
+    }
+    Ok(events)
+}
+
+fn history_event_from_values(
+    values: (String, String, Option<i64>, Option<String>),
+) -> Result<HistoryEvent, AppError> {
+    let checked_at = history::parse_timestamp(&values.0).ok_or_else(|| {
+        AppError::Db(format!(
+            "invalid check timestamp stored for history: {}",
+            values.0
+        ))
+    })?;
+    Ok(HistoryEvent {
+        checked_at,
+        status: HistoryStatus::from_db(&values.1).ok_or_else(|| {
+            AppError::Db(format!("invalid check status stored for history: {}", values.1))
+        })?,
+        response_time_ms: values.2,
+        failure_reason: values.3,
+    })
+}
+
+fn monitor_status(monitor: &Monitor) -> Result<MonitorStatus, AppError> {
+    MonitorStatus::from_db(&monitor.uptime_status).ok_or_else(|| {
+        AppError::Db(format!(
+            "invalid monitor status stored for history: {}",
+            monitor.uptime_status
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use std::time::{Duration as StdDuration, Instant};
 
     fn input(url: &str) -> MonitorInput {
         MonitorInput {
@@ -585,6 +712,33 @@ mod tests {
             uptime_check_enabled: true,
             cert_check_enabled: None,
         }
+    }
+
+    fn insert_result(
+        store: &Store,
+        monitor_id: i64,
+        checked_at: DateTime<Utc>,
+        status: &str,
+        response_time_ms: Option<i64>,
+        failure_reason: Option<&str>,
+    ) {
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO check_results
+                       (monitor_id, checked_at, status, response_time_ms, failure_reason)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        monitor_id,
+                        history::format_timestamp(checked_at),
+                        status,
+                        response_time_ms,
+                        failure_reason
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -749,5 +903,159 @@ mod tests {
             })
             .unwrap();
         assert!(store.get_settings().unwrap().autostart_enabled);
+    }
+
+    #[test]
+    fn history_stats_are_duration_weighted_and_exclude_gaps() {
+        let store = Store::open_in_memory().unwrap();
+        let monitor = store.create_monitor(&input("https://example.com")).unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 8, 10, 0, 0, 0).unwrap();
+        let now = start + Duration::hours(24);
+        insert_result(&store, monitor.id, start, "up", Some(100), None);
+        insert_result(
+            &store,
+            monitor.id,
+            start + Duration::hours(12),
+            "down",
+            Some(300),
+            Some("timeout"),
+        );
+        insert_result(
+            &store,
+            monitor.id,
+            start + Duration::hours(18),
+            "gap",
+            None,
+            None,
+        );
+
+        let stats = store.get_uptime_stats_at(monitor.id, now).unwrap();
+
+        assert_eq!(stats.uptime_24h, Some(66.7));
+        assert_eq!(stats.avg_response_time_ms_24h, Some(200.0));
+        let history = store
+            .get_history_at(monitor.id, HistoryRange::Day, now)
+            .unwrap();
+        assert_eq!(history.points.len(), 3);
+        assert_eq!(history.points[2].status, crate::history::PointStatus::Gap);
+        assert_eq!(history.incidents.len(), 1);
+        assert!(history.incidents[0].includes_gap);
+    }
+
+    #[test]
+    fn history_queries_use_the_monitor_time_index() {
+        let store = Store::open_in_memory().unwrap();
+        let details = store
+            .with_conn(|conn| {
+                let plans = [
+                    "EXPLAIN QUERY PLAN
+                         SELECT checked_at, status, response_time_ms, failure_reason
+                         FROM check_results
+                         WHERE monitor_id = 1 AND checked_at >= '2026-01-01'
+                           AND checked_at < '2026-02-01'
+                         ORDER BY checked_at, id",
+                    "EXPLAIN QUERY PLAN
+                         SELECT checked_at, status, response_time_ms, failure_reason
+                         FROM check_results
+                         WHERE monitor_id = 1 AND checked_at < '2026-01-01'
+                         ORDER BY checked_at DESC, id DESC LIMIT 1",
+                ];
+                let mut details = Vec::new();
+                for sql in plans {
+                    let mut statement = conn.prepare(sql)?;
+                    let rows = statement.query_map([], |row| row.get::<_, String>(3))?;
+                    details.push(rows.collect::<Result<Vec<_>, _>>()?.join(" "));
+                }
+                Ok(details)
+            })
+            .unwrap();
+
+        for detail in details {
+            assert!(
+                detail.contains("idx_check_results_monitor_time"),
+                "{detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn month_history_stays_fast_with_one_hundred_thousand_results() {
+        let store = Store::open_in_memory().unwrap();
+        let monitor = store.create_monitor(&input("https://example.com")).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 11, 0, 0, 0).unwrap();
+        let start = now - Duration::days(30);
+        store
+            .with_conn(|conn| {
+                let tx = conn.transaction()?;
+                {
+                    let mut statement = tx.prepare(
+                        "INSERT INTO check_results
+                           (monitor_id, checked_at, status, response_time_ms)
+                         VALUES (?1, ?2, 'up', 100)",
+                    )?;
+                    for index in 0..100_000_i64 {
+                        let checked_at = start + Duration::milliseconds(index * 25_920);
+                        statement.execute(params![monitor.id, history::format_timestamp(checked_at)])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+
+        let started = Instant::now();
+        let history = store
+            .get_history_at(monitor.id, HistoryRange::Month, now)
+            .unwrap();
+
+        assert!(started.elapsed() < StdDuration::from_secs(1));
+        assert!(history.points.len() <= 500);
+    }
+
+    #[test]
+    fn dashboard_queries_twenty_monitors_without_jank() {
+        let store = Store::open_in_memory().unwrap();
+        let monitors: Vec<Monitor> = (0..20)
+            .map(|index| {
+                store
+                    .create_monitor(&input(&format!("https://{index}.example.com")))
+                    .unwrap()
+            })
+            .collect();
+        let now = Utc.with_ymd_and_hms(2026, 8, 11, 0, 0, 0).unwrap();
+        let start = now - Duration::days(30);
+        store
+            .with_conn(|conn| {
+                let tx = conn.transaction()?;
+                {
+                    let mut statement = tx.prepare(
+                        "INSERT INTO check_results
+                           (monitor_id, checked_at, status, response_time_ms)
+                         VALUES (?1, ?2, 'up', 100)",
+                    )?;
+                    for monitor in &monitors {
+                        for index in 0..8_640_i64 {
+                            let checked_at = start + Duration::minutes(index * 5);
+                            statement.execute(params![
+                                monitor.id,
+                                history::format_timestamp(checked_at)
+                            ])?;
+                        }
+                    }
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+
+        let started = Instant::now();
+        for monitor in &monitors {
+            store.get_uptime_stats_at(monitor.id, now).unwrap();
+            store
+                .get_history_at(monitor.id, HistoryRange::Day, now)
+                .unwrap();
+        }
+
+        assert!(started.elapsed() < StdDuration::from_secs(1));
     }
 }
