@@ -15,14 +15,19 @@ import type { Monitor } from "@/lib/tauri";
 interface DeleteMonitorDialogProps {
   monitor: Monitor | null;
   onOpenChange: (open: boolean) => void;
+  onDeleted?: () => void;
 }
 
 export function DeleteMonitorDialog({
   monitor,
   onOpenChange,
+  onDeleted,
 }: DeleteMonitorDialogProps) {
   const deleteMonitor = useDeleteMonitor({
-    onSuccess: () => onOpenChange(false),
+    onSuccess: () => {
+      onOpenChange(false);
+      onDeleted?.();
+    },
   });
 
   // Keep the last monitor around so the text doesn't blank out during the
