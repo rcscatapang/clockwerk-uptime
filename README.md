@@ -35,6 +35,18 @@ Design rules:
 - **Secrets in Keychain** — the Slack webhook URL never lands in SQLite and is never sent to the frontend.
 - **Minimal Tauri capabilities** — no shell, no filesystem access from the frontend.
 
+## Alerting behavior
+
+| Event | Native notification | Slack |
+|---|---|---|
+| Monitor goes down after two consecutive failures | Sent | Sent when configured |
+| Monitor remains down for 60 minutes | Sent again every hour | Sent again every hour when configured |
+| Monitor recovers after a delivered down alert | Sent with downtime | Sent with downtime when configured |
+
+A recovery stays silent when the preceding failures never produced a down
+alert. Saving a Slack webhook sends a test message before the URL is stored in
+macOS Keychain; removing it leaves native alerts enabled.
+
 ## Stack
 
 | Layer | Choice |
@@ -56,10 +68,13 @@ npm run tauri dev     # run the app with hot reload
 npm run tauri build   # produce a local .app / .dmg
 ```
 
-CI-style check (no CI is set up yet; run this before committing):
+GitHub Actions runs the frontend and Rust tests and builds on pull requests to
+`main`. Run the same checks locally before committing:
 
 ```sh
-npm run build && (cd src-tauri && cargo check)
+npm test && npm run build
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
 The SQLite database lives in the app data directory (`~/Library/Application Support/<bundle-id>/monitor.db`).

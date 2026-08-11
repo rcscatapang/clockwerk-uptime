@@ -20,7 +20,11 @@ import { toast } from "sonner";
 
 import { errorMessage } from "@/lib/errors";
 import * as api from "@/lib/tauri";
-import type { Monitor, MonitorInput, Settings } from "@/lib/tauri";
+import type {
+  Monitor,
+  MonitorInput,
+  Settings,
+} from "@/lib/tauri";
 
 export const monitorKeys = {
   all: ["monitors"] as const,
@@ -90,6 +94,12 @@ export function useCheckNow(opts?: MutationOpts<Monitor, number>) {
 
 export function useUpdateSettings(opts?: MutationOpts<Settings, Settings>) {
   return useInvalidatingMutation(api.updateSettings, [settingsKeys.all], opts);
+}
+
+export function useSetSlackWebhook(
+  opts?: MutationOpts<Settings, string>,
+) {
+  return useInvalidatingMutation(api.setSlackWebhook, [settingsKeys.all], opts);
 }
 
 /**
