@@ -20,7 +20,12 @@ import { toast } from "sonner";
 
 import { errorMessage } from "@/lib/errors";
 import * as api from "@/lib/tauri";
-import type { Monitor, MonitorInput, Settings } from "@/lib/tauri";
+import type {
+  Monitor,
+  MonitorInput,
+  Settings,
+  SlackWebhookStatus,
+} from "@/lib/tauri";
 
 export const monitorKeys = {
   all: ["monitors"] as const,
@@ -28,6 +33,7 @@ export const monitorKeys = {
 
 export const settingsKeys = {
   all: ["settings"] as const,
+  slack: ["settings", "slack"] as const,
 };
 
 export function useMonitors() {
@@ -36,6 +42,13 @@ export function useMonitors() {
 
 export function useSettings() {
   return useQuery({ queryKey: settingsKeys.all, queryFn: api.getSettings });
+}
+
+export function useSlackWebhookStatus() {
+  return useQuery({
+    queryKey: settingsKeys.slack,
+    queryFn: api.getSlackWebhookStatus,
+  });
 }
 
 type MutationOpts<TData, TVariables> = Pick<
@@ -90,6 +103,25 @@ export function useCheckNow(opts?: MutationOpts<Monitor, number>) {
 
 export function useUpdateSettings(opts?: MutationOpts<Settings, Settings>) {
   return useInvalidatingMutation(api.updateSettings, [settingsKeys.all], opts);
+}
+
+export function useSetSlackWebhook(
+  opts?: MutationOpts<SlackWebhookStatus, string>,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (url: string) => api.setSlackWebhook(url),
+    onSuccess: (data, variables, onMutateResult, context) => {
+      queryClient.setQueryData(settingsKeys.slack, data);
+      return opts?.onSuccess?.(data, variables, onMutateResult, context);
+    },
+    onError: (error, variables, onMutateResult, context) => {
+      if (opts?.onError) {
+        return opts.onError(error, variables, onMutateResult, context);
+      }
+      toast.error(errorMessage(error));
+    },
+  });
 }
 
 /**

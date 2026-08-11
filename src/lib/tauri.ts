@@ -82,6 +82,10 @@ export interface Settings {
   autostartEnabled: boolean;
 }
 
+export interface SlackWebhookStatus {
+  configured: boolean;
+}
+
 export function listMonitors(): Promise<Monitor[]> {
   return invoke<Monitor[]>("list_monitors");
 }
@@ -112,4 +116,12 @@ export function getSettings(): Promise<Settings> {
 
 export function updateSettings(settings: Settings): Promise<Settings> {
   return invoke<Settings>("update_settings", { settings });
+}
+
+export function getSlackWebhookStatus(): Promise<SlackWebhookStatus> {
+  return invoke<SlackWebhookStatus>("get_slack_webhook_status");
+}
+
+export function setSlackWebhook(url: string): Promise<SlackWebhookStatus> {
+  return invoke<SlackWebhookStatus>("set_slack_webhook", { url });
 }
