@@ -7,6 +7,7 @@
 //! - Versioned migrations run idempotently at startup before anything else
 //!   touches the DB; `PRAGMA foreign_keys = ON` on every connection.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -23,6 +24,8 @@ use crate::error::AppError;
 use crate::history::{
     self, HistoryEvent, HistoryRange, HistoryResponse, HistoryStatus, MonitorStatus, UptimeStats,
 };
+
+pub const HISTORY_RETENTION_DAYS: i64 = 90;
 
 /// Ordered, append-only migration list. `schema_migrations` records which
 /// versions have been applied; each entry runs at most once, in a transaction.
@@ -72,6 +75,8 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE monitors ADD COLUMN cert_last_check_at TEXT;
     ALTER TABLE monitors ADD COLUMN cert_expiry_alert_sent_at TEXT;
     ",
+    // v3 — retention scans history across every monitor by timestamp.
+    "CREATE INDEX idx_check_results_time ON check_results (checked_at);",
 ];
 
 /// The `monitors.uptime_status` values. Stored as text; the frontend types
@@ -176,6 +181,7 @@ pub struct RecordedCheck {
     pub before: Monitor,
     pub after: Monitor,
     pub event: Option<crate::state::TransitionEvent>,
+    pub observed_downtime_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +244,14 @@ pub struct Settings {
     pub autostart_enabled: bool,
     #[serde(default)]
     pub slack_webhook_configured: bool,
+    #[serde(default = "history_retention_days")]
+    pub history_retention_days: i64,
+    #[serde(default)]
+    pub last_prune_at: Option<String>,
+}
+
+fn history_retention_days() -> i64 {
+    HISTORY_RETENTION_DAYS
 }
 
 impl Default for Settings {
@@ -245,6 +259,8 @@ impl Default for Settings {
         Settings {
             autostart_enabled: false,
             slack_webhook_configured: false,
+            history_retention_days: HISTORY_RETENTION_DAYS,
+            last_prune_at: None,
         }
     }
 }
@@ -574,11 +590,28 @@ impl Store {
                 params![id],
                 monitor_from_row,
             )?;
+            let observed_downtime_seconds = if change.event
+                == Some(crate::state::TransitionEvent::Recovered)
+            {
+                match (
+                    monitor
+                        .status_last_change_at
+                        .as_deref()
+                        .and_then(history::parse_timestamp),
+                    history::parse_timestamp(&now),
+                ) {
+                    (Some(start), Some(end)) => Some(observed_down_seconds(&tx, id, start, end)?),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             tx.commit()?;
             Ok(RecordedCheck {
                 before: monitor,
                 after: updated,
                 event: change.event,
+                observed_downtime_seconds,
             })
         })
     }
@@ -679,6 +712,138 @@ impl Store {
         })
     }
 
+    /// Insert a `gap` start marker at the final real check time. Its end is
+    /// implicit in the next real result, so aggregation excludes that span.
+    pub fn record_launch_gaps_at(&self, now: DateTime<Utc>) -> Result<Vec<i64>, AppError> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            let candidates = {
+                let mut statement = tx.prepare(
+                    "SELECT id, check_interval_minutes, last_check_at,
+                            uptime_status, down_alert_sent_at
+                     FROM monitors
+                     WHERE uptime_check_enabled = 1 AND last_check_at IS NOT NULL",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let now_text = history::format_timestamp(now);
+            let mut inserted = Vec::new();
+            for (id, interval_minutes, last_check_text, status, alert_sent_at) in candidates {
+                let Some(last_check) = history::parse_timestamp(&last_check_text) else {
+                    tracing::warn!(
+                        monitor_id = id,
+                        "skipping gap with invalid last-check timestamp"
+                    );
+                    continue;
+                };
+                if now.signed_duration_since(last_check)
+                    <= Duration::minutes(interval_minutes.saturating_mul(2))
+                {
+                    continue;
+                }
+                let latest: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT checked_at, status FROM check_results
+                         WHERE monitor_id = ?1 ORDER BY checked_at DESC, id DESC LIMIT 1",
+                        params![id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((checked_at, result_status)) = latest {
+                    let result_status = history_status_from_db(&result_status)?;
+                    if checked_at == last_check_text && result_status == HistoryStatus::Gap {
+                        continue;
+                    }
+                }
+                tx.execute(
+                    "INSERT INTO check_results
+                       (monitor_id, checked_at, status, response_time_ms, failure_reason)
+                     VALUES (?1, ?2, 'gap', NULL, NULL)",
+                    params![id, last_check_text],
+                )?;
+                if status == uptime_status::DOWN && alert_sent_at.is_some() {
+                    tx.execute(
+                        "UPDATE monitors SET down_alert_sent_at = ?1 WHERE id = ?2",
+                        params![now_text, id],
+                    )?;
+                }
+                inserted.push(id);
+            }
+            tx.commit()?;
+            Ok(inserted)
+        })
+    }
+
+    pub fn record_launch_gaps(&self) -> Result<Vec<i64>, AppError> {
+        self.record_launch_gaps_at(Utc::now())
+    }
+
+    pub fn prune_history_batch_before(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<usize, AppError> {
+        if batch_size == 0 {
+            return Ok(0);
+        }
+        self.with_conn(|conn| {
+            let deleted = conn.execute(
+                "DELETE FROM check_results WHERE id IN (
+                   SELECT id FROM check_results WHERE checked_at < ?1
+                   ORDER BY checked_at, id LIMIT ?2
+                 )",
+                params![history::format_timestamp(cutoff), batch_size as i64],
+            )?;
+            Ok(deleted)
+        })
+    }
+
+    pub fn post_gap_suppressed_monitor_ids(&self) -> Result<HashSet<i64>, AppError> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT monitors.id, recent.status
+                 FROM monitors
+                 JOIN check_results AS recent ON recent.id IN (
+                   SELECT id FROM check_results
+                   WHERE monitor_id = monitors.id
+                   ORDER BY checked_at DESC, id DESC LIMIT 2
+                 )
+                 WHERE monitors.uptime_status = 'down'",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut suppressed = HashSet::new();
+            for row in rows {
+                let (monitor_id, status) = row?;
+                if history_status_from_db(&status)? == HistoryStatus::Gap {
+                    suppressed.insert(monitor_id);
+                }
+            }
+            Ok(suppressed)
+        })
+    }
+
+    pub fn set_last_prune_at(&self, pruned_at: &str) -> Result<(), AppError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('last_prune_at', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![pruned_at],
+            )?;
+            Ok(())
+        })
+    }
+
     // --- settings -----------------------------------------------------------
 
     pub fn get_settings(&self) -> Result<Settings, AppError> {
@@ -690,11 +855,20 @@ impl Store {
                     |r| r.get(0),
                 )
                 .optional()?;
+            let last_prune_at: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key = 'last_prune_at'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
             Ok(Settings {
                 autostart_enabled: autostart.as_deref() == Some("true"),
                 // Enriched by the command layer from Keychain. The SQLite
                 // store deliberately has no access to secrets.
                 slack_webhook_configured: false,
+                history_retention_days: HISTORY_RETENTION_DAYS,
+                last_prune_at,
             })
         })
     }
@@ -847,15 +1021,56 @@ fn history_event_from_values(
     })?;
     Ok(HistoryEvent {
         checked_at,
-        status: HistoryStatus::from_db(&values.1).ok_or_else(|| {
-            AppError::Db(format!(
-                "invalid check status stored for history: {}",
-                values.1
-            ))
-        })?,
+        status: history_status_from_db(&values.1)?,
         response_time_ms: values.2,
         failure_reason: values.3,
     })
+}
+
+fn history_status_from_db(value: &str) -> Result<HistoryStatus, AppError> {
+    HistoryStatus::from_db(value)
+        .ok_or_else(|| AppError::Db(format!("invalid check status stored for history: {value}")))
+}
+
+fn observed_down_seconds(
+    conn: &Connection,
+    monitor_id: i64,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<i64, AppError> {
+    let mut statement = conn.prepare(
+        "SELECT checked_at, status FROM check_results
+         WHERE monitor_id = ?1 AND checked_at >= ?2 AND checked_at < ?3
+         ORDER BY checked_at, id",
+    )?;
+    let rows = statement.query_map(
+        params![
+            monitor_id,
+            history::format_timestamp(start),
+            history::format_timestamp(end)
+        ],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    let mut status = HistoryStatus::Down;
+    let mut cursor = start;
+    let mut observed_seconds = 0;
+    for row in rows {
+        let (checked_at, next_status) = row?;
+        let checked_at = history::parse_timestamp(&checked_at).ok_or_else(|| {
+            AppError::Db(format!(
+                "invalid check timestamp stored for downtime: {checked_at}"
+            ))
+        })?;
+        if checked_at > cursor && status == HistoryStatus::Down {
+            observed_seconds += (checked_at - cursor).num_seconds().max(0);
+        }
+        cursor = cursor.max(checked_at);
+        status = history_status_from_db(&next_status)?;
+    }
+    if cursor < end && status == HistoryStatus::Down {
+        observed_seconds += (end - cursor).num_seconds().max(0);
+    }
+    Ok(observed_seconds)
 }
 
 fn monitor_status(monitor: &Monitor) -> Result<MonitorStatus, AppError> {
@@ -1076,7 +1291,7 @@ mod tests {
                 Ok(v.collect::<Result<Vec<_>, _>>()?)
             })
             .unwrap();
-        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(versions, vec![1, 2, 3]);
         let certificate_columns = store
             .with_conn(|conn| {
                 let mut statement = conn.prepare("PRAGMA table_info(monitors)")?;
@@ -1115,14 +1330,312 @@ mod tests {
     #[test]
     fn settings_round_trip() {
         let store = Store::open_in_memory().unwrap();
-        assert!(!store.get_settings().unwrap().autostart_enabled);
+        let initial = store.get_settings().unwrap();
+        assert!(!initial.autostart_enabled);
+        assert_eq!(initial.history_retention_days, HISTORY_RETENTION_DAYS);
+        assert!(initial.last_prune_at.is_none());
         store
             .save_settings(&Settings {
                 autostart_enabled: true,
                 slack_webhook_configured: false,
+                history_retention_days: HISTORY_RETENTION_DAYS,
+                last_prune_at: None,
             })
             .unwrap();
         assert!(store.get_settings().unwrap().autostart_enabled);
+        store.set_last_prune_at("2026-08-12T12:00:00.000Z").unwrap();
+        assert_eq!(
+            store.get_settings().unwrap().last_prune_at.as_deref(),
+            Some("2026-08-12T12:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn launch_gap_eligibility_is_idempotent() {
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 12, 0, 0).unwrap();
+        let never_checked = store
+            .create_monitor(&input("https://never.example.com"))
+            .unwrap();
+        let within = store
+            .create_monitor(&input("https://within.example.com"))
+            .unwrap();
+        let beyond = store
+            .create_monitor(&input("https://beyond.example.com"))
+            .unwrap();
+        let mut disabled_input = input("https://disabled.example.com");
+        disabled_input.uptime_check_enabled = false;
+        let disabled = store.create_monitor(&disabled_input).unwrap();
+
+        for (monitor, last_check_at) in [
+            (&within, now - Duration::minutes(10)),
+            (&beyond, now - Duration::minutes(11)),
+            (&disabled, now - Duration::minutes(11)),
+        ] {
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE monitors SET last_check_at = ?1 WHERE id = ?2",
+                        params![history::format_timestamp(last_check_at), monitor.id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            insert_result(&store, monitor.id, last_check_at, "up", Some(100), None);
+        }
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE monitors SET uptime_status = 'down', down_alert_sent_at = ?1
+                     WHERE id = ?2",
+                    params![
+                        history::format_timestamp(now - Duration::hours(2)),
+                        beyond.id
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(store.record_launch_gaps_at(now).unwrap(), vec![beyond.id]);
+        assert!(store.record_launch_gaps_at(now).unwrap().is_empty());
+        let beyond_after = store.get_monitor(beyond.id).unwrap();
+        assert_eq!(
+            beyond_after.down_alert_sent_at.as_deref(),
+            Some(history::format_timestamp(now).as_str())
+        );
+        assert!(crate::alerter::decide_still_down(&beyond_after, now).is_none());
+        assert!(store
+            .post_gap_suppressed_monitor_ids()
+            .unwrap()
+            .contains(&beyond.id));
+        insert_result(&store, beyond.id, now, "down", Some(100), Some("timeout"));
+        assert!(store
+            .post_gap_suppressed_monitor_ids()
+            .unwrap()
+            .contains(&beyond.id));
+        insert_result(
+            &store,
+            beyond.id,
+            now + Duration::seconds(30),
+            "down",
+            Some(100),
+            Some("timeout"),
+        );
+        assert!(!store
+            .post_gap_suppressed_monitor_ids()
+            .unwrap()
+            .contains(&beyond.id));
+
+        let gaps = store
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT monitor_id, checked_at FROM check_results
+                     WHERE status = 'gap' ORDER BY monitor_id",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(
+            gaps,
+            vec![(
+                beyond.id,
+                history::format_timestamp(now - Duration::minutes(11))
+            )]
+        );
+        assert_ne!(never_checked.id, beyond.id);
+    }
+
+    #[test]
+    fn generated_gaps_exclude_unknown_time_and_annotate_incidents() {
+        let store = Store::open_in_memory().unwrap();
+        let launch = Utc.with_ymd_and_hms(2026, 8, 12, 12, 0, 0).unwrap();
+
+        for (index, before_status, after_status) in
+            [(0, "down", "up"), (1, "up", "up"), (2, "down", "down")]
+        {
+            let monitor = store
+                .create_monitor(&input(&format!("https://gap-{index}.example.com")))
+                .unwrap();
+            let last_check = launch - Duration::minutes(15);
+            insert_result(
+                &store,
+                monitor.id,
+                last_check - Duration::minutes(5),
+                before_status,
+                Some(100),
+                (before_status == "down").then_some("timeout"),
+            );
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE monitors SET uptime_status = ?1, last_check_at = ?2,
+                         status_last_change_at = ?3, down_alert_sent_at = ?4
+                         WHERE id = ?5",
+                        params![
+                            before_status,
+                            history::format_timestamp(last_check),
+                            history::format_timestamp(last_check - Duration::minutes(5)),
+                            (before_status == "down")
+                                .then(|| history::format_timestamp(last_check)),
+                            monitor.id
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+
+            assert_eq!(
+                store.record_launch_gaps_at(launch).unwrap(),
+                vec![monitor.id]
+            );
+            insert_result(
+                &store,
+                monitor.id,
+                launch,
+                after_status,
+                Some(120),
+                (after_status == "down").then_some("timeout"),
+            );
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE monitors SET uptime_status = ?1, last_check_at = ?2 WHERE id = ?3",
+                        params![after_status, history::format_timestamp(launch), monitor.id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+
+            let response = store
+                .get_history_at(monitor.id, HistoryRange::Day, launch + Duration::minutes(5))
+                .unwrap();
+            let stats = store
+                .get_uptime_stats_at(monitor.id, launch + Duration::minutes(5))
+                .unwrap();
+            let expected_uptime = match (before_status, after_status) {
+                ("down", "up") => 50.0,
+                ("up", "up") => 100.0,
+                ("down", "down") => 0.0,
+                _ => unreachable!(),
+            };
+            assert_eq!(stats.uptime_24h, Some(expected_uptime));
+            assert!(response.points.iter().any(|point| {
+                point.status == crate::history::PointStatus::Gap
+                    && point.started_at == history::format_timestamp(last_check)
+            }));
+            if before_status == "down" {
+                assert!(response.incidents[0].includes_gap);
+                let expected_duration = if after_status == "down" { 600 } else { 300 };
+                assert_eq!(response.incidents[0].duration_seconds, expected_duration);
+            } else {
+                assert!(response.incidents.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_alert_duration_excludes_a_generated_gap() {
+        let store = Store::open_in_memory().unwrap();
+        let monitor = store.create_monitor(&input("https://example.com")).unwrap();
+        let launch = Utc::now();
+        let down_started = launch - Duration::minutes(20);
+        let last_check = launch - Duration::minutes(15);
+        insert_result(
+            &store,
+            monitor.id,
+            down_started,
+            "down",
+            Some(100),
+            Some("timeout"),
+        );
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE monitors SET uptime_status = 'down', last_check_at = ?1,
+                     status_last_change_at = ?2, down_alert_sent_at = ?3 WHERE id = ?4",
+                    params![
+                        history::format_timestamp(last_check),
+                        history::format_timestamp(down_started),
+                        history::format_timestamp(down_started),
+                        monitor.id
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store.record_launch_gaps_at(launch).unwrap();
+
+        let recorded = store
+            .record_check(
+                monitor.id,
+                &crate::checker::CheckOutcome {
+                    success: true,
+                    http_status: Some(200),
+                    response_time_ms: 100,
+                    failure_reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        let alert = crate::alerter::decide_after_check(&recorded, Utc::now()).unwrap();
+
+        assert_eq!(recorded.observed_downtime_seconds, Some(300));
+        assert!(alert.body.contains("5 min"), "{}", alert.body);
+    }
+
+    #[test]
+    fn retention_prunes_only_rows_strictly_older_than_the_boundary_in_batches() {
+        let store = Store::open_in_memory().unwrap();
+        let monitor = store.create_monitor(&input("https://example.com")).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 12, 0, 0).unwrap();
+        let cutoff = now - Duration::days(HISTORY_RETENTION_DAYS);
+        for offset in [-2_i64, -1, 0, 1] {
+            insert_result(
+                &store,
+                monitor.id,
+                cutoff + Duration::seconds(offset),
+                "up",
+                Some(100),
+                None,
+            );
+        }
+
+        assert_eq!(store.prune_history_batch_before(cutoff, 1).unwrap(), 1);
+        assert_eq!(store.prune_history_batch_before(cutoff, 1).unwrap(), 1);
+        assert_eq!(store.prune_history_batch_before(cutoff, 1).unwrap(), 0);
+
+        let remaining = store
+            .with_conn(|conn| {
+                let mut statement =
+                    conn.prepare("SELECT checked_at FROM check_results ORDER BY checked_at, id")?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![
+                history::format_timestamp(cutoff),
+                history::format_timestamp(cutoff + Duration::seconds(1))
+            ]
+        );
+
+        let plan = store
+            .with_conn(|conn| {
+                Ok(conn.query_row(
+                    "EXPLAIN QUERY PLAN
+                     SELECT id FROM check_results WHERE checked_at < '2026-01-01'
+                     ORDER BY checked_at, id LIMIT 5000",
+                    [],
+                    |row| row.get::<_, String>(3),
+                )?)
+            })
+            .unwrap();
+        assert!(plan.contains("idx_check_results_time"), "{plan}");
     }
 
     #[test]

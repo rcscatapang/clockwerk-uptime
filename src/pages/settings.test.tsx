@@ -40,14 +40,37 @@ beforeEach(() => {
   getSettingsMock.mockResolvedValue({
     autostartEnabled: false,
     slackWebhookConfigured: false,
+    historyRetentionDays: 90,
+    lastPruneAt: null,
   });
 });
 
 describe("SettingsPage alerting", () => {
+  it("shows the fixed retention window and last prune time", async () => {
+    const lastPruneAt = "2026-08-12T01:02:03.000Z";
+    getSettingsMock.mockResolvedValue({
+      autostartEnabled: false,
+      slackWebhookConfigured: false,
+      historyRetentionDays: 90,
+      lastPruneAt,
+    });
+
+    renderSettings();
+
+    expect(await screen.findByText("History retention: 90 days")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        `Last pruned: ${new Date(lastPruneAt).toLocaleString()}`,
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("shows Slack configuration without exposing the stored webhook", async () => {
     getSettingsMock.mockResolvedValue({
       autostartEnabled: false,
       slackWebhookConfigured: true,
+      historyRetentionDays: 90,
+      lastPruneAt: null,
     });
     renderSettings();
 
@@ -60,10 +83,14 @@ describe("SettingsPage alerting", () => {
     setSlackWebhookMock.mockResolvedValue({
       autostartEnabled: false,
       slackWebhookConfigured: true,
+      historyRetentionDays: 90,
+      lastPruneAt: null,
     });
     getSettingsMock.mockResolvedValue({
       autostartEnabled: false,
       slackWebhookConfigured: true,
+      historyRetentionDays: 90,
+      lastPruneAt: null,
     });
     renderSettings();
 
@@ -84,10 +111,14 @@ describe("SettingsPage alerting", () => {
     getSettingsMock.mockResolvedValue({
       autostartEnabled: false,
       slackWebhookConfigured: true,
+      historyRetentionDays: 90,
+      lastPruneAt: null,
     });
     setSlackWebhookMock.mockResolvedValue({
       autostartEnabled: false,
       slackWebhookConfigured: false,
+      historyRetentionDays: 90,
+      lastPruneAt: null,
     });
     renderSettings();
 
