@@ -24,7 +24,6 @@ import type {
   Monitor,
   MonitorInput,
   Settings,
-  SlackWebhookStatus,
 } from "@/lib/tauri";
 
 export const monitorKeys = {
@@ -33,7 +32,6 @@ export const monitorKeys = {
 
 export const settingsKeys = {
   all: ["settings"] as const,
-  slack: ["settings", "slack"] as const,
 };
 
 export function useMonitors() {
@@ -42,13 +40,6 @@ export function useMonitors() {
 
 export function useSettings() {
   return useQuery({ queryKey: settingsKeys.all, queryFn: api.getSettings });
-}
-
-export function useSlackWebhookStatus() {
-  return useQuery({
-    queryKey: settingsKeys.slack,
-    queryFn: api.getSlackWebhookStatus,
-  });
 }
 
 type MutationOpts<TData, TVariables> = Pick<
@@ -106,22 +97,9 @@ export function useUpdateSettings(opts?: MutationOpts<Settings, Settings>) {
 }
 
 export function useSetSlackWebhook(
-  opts?: MutationOpts<SlackWebhookStatus, string>,
+  opts?: MutationOpts<Settings, string>,
 ) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (url: string) => api.setSlackWebhook(url),
-    onSuccess: (data, variables, onMutateResult, context) => {
-      queryClient.setQueryData(settingsKeys.slack, data);
-      return opts?.onSuccess?.(data, variables, onMutateResult, context);
-    },
-    onError: (error, variables, onMutateResult, context) => {
-      if (opts?.onError) {
-        return opts.onError(error, variables, onMutateResult, context);
-      }
-      toast.error(errorMessage(error));
-    },
-  });
+  return useInvalidatingMutation(api.setSlackWebhook, [settingsKeys.all], opts);
 }
 
 /**

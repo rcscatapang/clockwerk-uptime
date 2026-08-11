@@ -2,11 +2,11 @@
 //!
 //! Decision rules:
 //! - **Down** fires exactly when the status flips to `down` (two consecutive
-//!   failures) and stamps `down_alert_sent_at`.
+//!   failures) and stamps `down_alert_sent_at` after a channel accepts it.
 //! - **Still down** re-fires while the status stays `down` and 60 minutes
 //!   have passed since the last alert; each one re-stamps
-//!   `down_alert_sent_at`. Because delivery failures are never retried on
-//!   their own, this hourly re-alert doubles as the delivery retry.
+//!   `down_alert_sent_at`. A failed or interrupted delivery has no stamp and
+//!   is retried on the next scheduler tick.
 //! - **Recovered** fires on success only if a down alert actually went out
 //!   (`down_alert_sent_at` set); it clears the stamp. A blip that never
 //!   crossed the threshold stays silent.
@@ -80,12 +80,18 @@ pub fn decide_still_down(monitor: &Monitor, now: DateTime<Utc>) -> Option<Alert>
     if monitor.uptime_status != uptime_status::DOWN {
         return None;
     }
-    let sent_at = monitor.down_alert_sent_at.as_deref()?;
-    let sent_at = DateTime::parse_from_rfc3339(sent_at)
-        .ok()?
-        .with_timezone(&Utc);
-    if now.signed_duration_since(sent_at).num_minutes() < REALERT_AFTER_MINUTES {
-        return None;
+    if let Some(sent_at) = monitor
+        .down_alert_sent_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+    {
+        if now
+            .signed_duration_since(sent_at.with_timezone(&Utc))
+            .num_minutes()
+            < REALERT_AFTER_MINUTES
+        {
+            return None;
+        }
     }
     let downtime = human_duration_between(monitor.status_last_change_at.as_deref(), now);
     Some(Alert {
@@ -132,9 +138,7 @@ pub fn human_duration_between(start: Option<&str>, end: DateTime<Utc>) -> String
     }
 }
 
-/// Deliver an alert: stale-check, stamp bookkeeping, then notify both
-/// channels. Channel failures are logged, never propagated.
-pub async fn dispatch(app: &AppHandle, store: &Arc<Store>, alert: Alert) {
+fn alert_is_current(store: &Store, alert: &Alert) -> bool {
     match store.get_monitor(alert.monitor_id) {
         Ok(current) => {
             if is_stale(&alert, &current.uptime_status) {
@@ -142,33 +146,58 @@ pub async fn dispatch(app: &AppHandle, store: &Arc<Store>, alert: Alert) {
                     monitor_id = alert.monitor_id,
                     "dropping stale alert: status moved on"
                 );
-                return;
+                return false;
             }
+            true
         }
-        Err(_) => return, // monitor deleted since the check
+        Err(_) => false, // monitor deleted since the check
     }
+}
 
-    if let Err(e) = store.set_down_alert_sent_at(alert.monitor_id, alert.sent_at_update.as_deref())
-    {
-        tracing::error!(monitor_id = alert.monitor_id, error = %e, "alert bookkeeping failed");
+fn record_delivery(store: &Store, alert: &Alert) -> bool {
+    match store.set_down_alert_sent_at_if_status(
+        alert.monitor_id,
+        alert.fired_for_status,
+        alert.sent_at_update.as_deref(),
+    ) {
+        Ok(recorded) => recorded,
+        Err(e) => {
+            tracing::error!(monitor_id = alert.monitor_id, error = %e, "alert bookkeeping failed");
+            false
+        }
     }
+}
 
-    if let Err(e) = app
-        .notification()
-        .builder()
-        .title(&alert.title)
-        .body(&alert.body)
-        .show()
-    {
-        tracing::warn!(error = %e, "native notification failed");
+/// Deliver an alert to each configured channel. The monitor status is checked
+/// at each delivery boundary, and bookkeeping is written only after a channel
+/// accepts the alert. Channel failures are logged, never propagated.
+pub async fn dispatch(app: &AppHandle, store: &Arc<Store>, alert: Alert) {
+    let mut delivery_recorded = false;
+
+    if alert_is_current(store, &alert) {
+        match app
+            .notification()
+            .builder()
+            .title(&alert.title)
+            .body(&alert.body)
+            .show()
+        {
+            Ok(()) => delivery_recorded = record_delivery(store, &alert),
+            Err(e) => tracing::warn!(error = %e, "native notification failed"),
+        }
     }
 
     match secrets::get_slack_webhook() {
-        Ok(Some(webhook)) => {
-            if let Err(e) = slack::send(&webhook, &slack_text(&alert, Utc::now())).await {
-                tracing::warn!(error = %e, "slack alert failed");
+        Ok(Some(webhook)) if alert_is_current(store, &alert) => {
+            match slack::send(&webhook, &slack_text(&alert, Utc::now())).await {
+                Ok(()) if !delivery_recorded => {
+                    record_delivery(store, &alert);
+                }
+                Ok(()) => {}
+                Err(e) => tracing::warn!(error = %e, "slack alert failed"),
             }
         }
+        Ok(Some(_)) => {}
         Ok(None) => {}
         Err(e) => tracing::warn!(error = %e, "keychain read failed while alerting"),
     }
@@ -299,12 +328,10 @@ mod tests {
     }
 
     #[test]
-    fn still_down_needs_down_status_and_prior_alert() {
+    fn failed_or_missing_down_alert_is_retried() {
         let now = Utc::now();
         assert!(decide_still_down(&monitor("up"), now).is_none());
-        // Down but no alert ever sent (e.g. app restarted mid-incident
-        // before the threshold): nothing to re-fire.
-        assert!(decide_still_down(&monitor("down"), now).is_none());
+        assert!(decide_still_down(&monitor("down"), now).is_some());
     }
 
     #[test]

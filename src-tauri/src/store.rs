@@ -180,12 +180,15 @@ fn default_true() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub autostart_enabled: bool,
+    #[serde(default)]
+    pub slack_webhook_configured: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             autostart_enabled: false,
+            slack_webhook_configured: false,
         }
     }
 }
@@ -456,17 +459,21 @@ impl Store {
         })
     }
 
-    /// Alert bookkeeping: when the last down alert went out (`None` clears).
-    pub fn set_down_alert_sent_at(&self, id: i64, sent_at: Option<&str>) -> Result<(), AppError> {
+    /// Update alert bookkeeping only while the monitor is still in the state
+    /// that caused the alert. Returns false when the alert became stale.
+    pub fn set_down_alert_sent_at_if_status(
+        &self,
+        id: i64,
+        expected_status: &str,
+        sent_at: Option<&str>,
+    ) -> Result<bool, AppError> {
         self.with_conn(|conn| {
             let changed = conn.execute(
-                "UPDATE monitors SET down_alert_sent_at = ?1 WHERE id = ?2",
-                params![sent_at, id],
+                "UPDATE monitors SET down_alert_sent_at = ?1
+                 WHERE id = ?2 AND uptime_status = ?3",
+                params![sent_at, id, expected_status],
             )?;
-            if changed == 0 {
-                return Err(AppError::NotFound);
-            }
-            Ok(())
+            Ok(changed == 1)
         })
     }
 
@@ -483,6 +490,9 @@ impl Store {
                 .optional()?;
             Ok(Settings {
                 autostart_enabled: autostart.as_deref() == Some("true"),
+                // Enriched by the command layer from Keychain. The SQLite
+                // store deliberately has no access to secrets.
+                slack_webhook_configured: false,
             })
         })
     }
@@ -722,6 +732,7 @@ mod tests {
         store
             .save_settings(&Settings {
                 autostart_enabled: true,
+                slack_webhook_configured: false,
             })
             .unwrap();
         assert!(store.get_settings().unwrap().autostart_enabled);
