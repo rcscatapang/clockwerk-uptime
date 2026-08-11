@@ -68,10 +68,13 @@ npm run tauri dev     # run the app with hot reload
 npm run tauri build   # produce a local .app / .dmg
 ```
 
-CI-style check (no CI is set up yet; run this before committing):
+GitHub Actions runs the frontend and Rust tests and builds on pull requests to
+`main`. Run the same checks locally before committing:
 
 ```sh
-npm run build && (cd src-tauri && cargo check)
+npm test && npm run build
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
 The SQLite database lives in the app data directory (`~/Library/Application Support/<bundle-id>/monitor.db`).
