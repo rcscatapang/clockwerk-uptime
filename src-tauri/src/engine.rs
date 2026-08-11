@@ -30,7 +30,7 @@ use tokio::sync::Semaphore;
 
 use crate::checker::{self, CheckConfig};
 use crate::error::AppError;
-use crate::store::{uptime_status, Monitor, Store};
+use crate::store::{uptime_status, Monitor, RecordedCheck, Store};
 
 pub const TICK_INTERVAL: Duration = Duration::from_secs(30);
 pub const MAX_IN_FLIGHT: usize = 10;
@@ -66,12 +66,12 @@ pub fn is_due(monitor: &Monitor, now: DateTime<Utc>) -> bool {
     }
 }
 
-/// Check every due monitor once. Returns the ids that were checked.
+/// Check every due monitor once.
 pub async fn run_cycle(
     store: &Arc<Store>,
     client: &reqwest::Client,
     config: &CheckConfig,
-) -> Result<Vec<i64>, AppError> {
+) -> Result<Vec<RecordedCheck>, AppError> {
     let now = Utc::now();
     let due: Vec<Monitor> = store
         .list_monitors()?
@@ -100,7 +100,7 @@ pub async fn run_cycle(
             )
             .await;
             match store.record_check(monitor.id, &outcome) {
-                Ok((_, _event)) => Some(monitor.id),
+                Ok(recorded) => Some(recorded),
                 Err(e) => {
                     tracing::error!(monitor_id = monitor.id, error = %e, "failed to record check");
                     None
@@ -112,7 +112,7 @@ pub async fn run_cycle(
     let mut checked = Vec::with_capacity(handles.len());
     for handle in handles {
         match handle.await {
-            Ok(Some(id)) => checked.push(id),
+            Ok(Some(recorded)) => checked.push(recorded),
             Ok(None) => {}
             Err(e) => tracing::error!(error = %e, "check task panicked"),
         }
@@ -126,7 +126,7 @@ pub async fn check_one(
     client: &reqwest::Client,
     config: &CheckConfig,
     id: i64,
-) -> Result<Monitor, AppError> {
+) -> Result<RecordedCheck, AppError> {
     let monitor = store.get_monitor(id)?;
     let outcome = checker::run_check(
         client,
@@ -136,8 +136,7 @@ pub async fn check_one(
         &monitor.look_for_string,
     )
     .await;
-    let (updated, _event) = store.record_check(id, &outcome)?;
-    Ok(updated)
+    store.record_check(id, &outcome)
 }
 
 /// Spawn the scheduler loop. Runs for the lifetime of the app, independent
@@ -153,15 +152,21 @@ pub fn start(app: AppHandle) {
         loop {
             interval.tick().await;
             match run_cycle(&store, &client, &config).await {
-                Ok(ids) if !ids.is_empty() => {
-                    if let Err(e) = app.emit(
-                        CHECK_COMPLETED_EVENT,
-                        CheckCompletedPayload { monitor_ids: ids },
-                    ) {
-                        tracing::error!(error = %e, "failed to emit check-completed");
+                Ok(checked) => {
+                    for recorded in &checked {
+                        crate::alerter::handle_check(&app, &store, recorded).await;
+                    }
+                    crate::alerter::process_still_down(&app, &store).await;
+                    if !checked.is_empty() {
+                        let ids = checked.iter().map(|r| r.after.id).collect();
+                        if let Err(e) = app.emit(
+                            CHECK_COMPLETED_EVENT,
+                            CheckCompletedPayload { monitor_ids: ids },
+                        ) {
+                            tracing::error!(error = %e, "failed to emit check-completed");
+                        }
                     }
                 }
-                Ok(_) => {}
                 Err(e) => tracing::error!(error = %e, "check cycle failed"),
             }
         }
@@ -286,7 +291,10 @@ mod tests {
         // Second cycle: both are due again (bad is not_yet_checked, ok not
         // due yet) — only bad runs, and it goes down at two failures.
         let checked = run_cycle(&store, &client, &config).await.unwrap();
-        assert_eq!(checked, vec![bad.id]);
+        assert_eq!(
+            checked.iter().map(|r| r.after.id).collect::<Vec<_>>(),
+            vec![bad.id]
+        );
         let bad_after = store.get_monitor(bad.id).unwrap();
         assert_eq!(bad_after.uptime_status, "down");
         assert_eq!(bad_after.uptime_failure_reason.as_deref(), Some("HTTP 500"));

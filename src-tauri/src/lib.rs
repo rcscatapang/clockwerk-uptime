@@ -10,9 +10,12 @@
 //     last window being destroyed) is vetoed so the process never dies silently;
 //     an explicit `app.exit(..)` from the tray passes through.
 
+mod alerter;
 mod checker;
 mod engine;
 mod error;
+mod secrets;
+mod slack;
 mod state;
 mod store;
 
@@ -66,14 +69,43 @@ async fn check_now(
     ctx: State<'_, CheckContext>,
     id: i64,
 ) -> Result<Monitor, AppError> {
-    let monitor = engine::check_one(store.inner(), &ctx.client, &ctx.config, id).await?;
+    let recorded = engine::check_one(store.inner(), &ctx.client, &ctx.config, id).await?;
+    alerter::handle_check(&app, store.inner(), &recorded).await;
     let _ = app.emit(
         engine::CHECK_COMPLETED_EVENT,
         engine::CheckCompletedPayload {
             monitor_ids: vec![id],
         },
     );
-    Ok(monitor)
+    Ok(recorded.after)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SlackWebhookStatus {
+    configured: bool,
+}
+
+#[tauri::command]
+fn get_slack_webhook_status() -> Result<SlackWebhookStatus, AppError> {
+    Ok(SlackWebhookStatus {
+        configured: secrets::get_slack_webhook()?.is_some(),
+    })
+}
+
+/// Set (or clear, with an empty string) the Slack webhook. A newly set
+/// webhook must accept a test message before it is stored.
+#[tauri::command]
+async fn set_slack_webhook(url: String) -> Result<SlackWebhookStatus, AppError> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        secrets::delete_slack_webhook()?;
+        return Ok(SlackWebhookStatus { configured: false });
+    }
+    slack::validate_webhook_url(&url)?;
+    slack::send(&url, "Uptime Monitor: webhook configured ✅").await?;
+    secrets::set_slack_webhook(&url)?;
+    Ok(SlackWebhookStatus { configured: true })
 }
 
 #[tauri::command]
@@ -119,6 +151,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             list_monitors,
             get_monitor,
@@ -126,6 +159,8 @@ pub fn run() {
             update_monitor,
             delete_monitor,
             check_now,
+            get_slack_webhook_status,
+            set_slack_webhook,
             get_settings,
             update_settings
         ])

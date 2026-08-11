@@ -125,7 +125,15 @@ pub struct Monitor {
     pub last_response_time_ms: Option<i64>,
 }
 
-// Not constructed yet; the check engine will produce these rows.
+/// Everything one recorded check produced: the monitor row before and after,
+/// and the state transition that fired, if any.
+#[derive(Debug, Clone)]
+pub struct RecordedCheck {
+    pub before: Monitor,
+    pub after: Monitor,
+    pub event: Option<crate::state::TransitionEvent>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -389,12 +397,11 @@ impl Store {
 
     /// Apply one check outcome atomically: read the monitor, run the state
     /// machine, update the monitor row, insert the `check_results` row.
-    /// Returns the updated monitor and the transition that fired, if any.
     pub fn record_check(
         &self,
         id: i64,
         outcome: &crate::checker::CheckOutcome,
-    ) -> Result<(Monitor, Option<crate::state::TransitionEvent>), AppError> {
+    ) -> Result<RecordedCheck, AppError> {
         self.with_conn(|conn| {
             let tx = conn.transaction()?;
             let monitor = tx.query_row(
@@ -441,7 +448,25 @@ impl Store {
                 monitor_from_row,
             )?;
             tx.commit()?;
-            Ok((updated, change.event))
+            Ok(RecordedCheck {
+                before: monitor,
+                after: updated,
+                event: change.event,
+            })
+        })
+    }
+
+    /// Alert bookkeeping: when the last down alert went out (`None` clears).
+    pub fn set_down_alert_sent_at(&self, id: i64, sent_at: Option<&str>) -> Result<(), AppError> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE monitors SET down_alert_sent_at = ?1 WHERE id = ?2",
+                params![sent_at, id],
+            )?;
+            if changed == 0 {
+                return Err(AppError::NotFound);
+            }
+            Ok(())
         })
     }
 
