@@ -7,12 +7,15 @@
 // - Mutations invalidate the affected keys and surface failures as a toast;
 //   forms that want inline errors handle them in their own onError first.
 
+import { useEffect } from "react";
+
 import {
   useMutation,
   useQuery,
   useQueryClient,
   type UseMutationOptions,
 } from "@tanstack/react-query";
+import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 
 import { errorMessage } from "@/lib/errors";
@@ -81,6 +84,26 @@ export function useDeleteMonitor(opts?: MutationOpts<void, number>) {
   return useInvalidatingMutation(api.deleteMonitor, [monitorKeys.all], opts);
 }
 
+export function useCheckNow(opts?: MutationOpts<Monitor, number>) {
+  return useInvalidatingMutation(api.checkNow, [monitorKeys.all], opts);
+}
+
 export function useUpdateSettings(opts?: MutationOpts<Settings, Settings>) {
   return useInvalidatingMutation(api.updateSettings, [settingsKeys.all], opts);
+}
+
+/**
+ * Refresh monitor data whenever the Rust engine finishes a check cycle.
+ * This is the only push channel from the backend — no polling anywhere.
+ */
+export function useCheckCompletedInvalidation() {
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    const unlisten = listen("check-completed", () => {
+      queryClient.invalidateQueries({ queryKey: monitorKeys.all });
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, [queryClient]);
 }

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 
 import { DeleteMonitorDialog } from "@/components/delete-monitor-dialog";
 import { MonitorFormDialog } from "@/components/monitor-form-dialog";
@@ -14,8 +14,9 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { formatMs, formatTimeAgo } from "@/lib/format";
 import { monitorToInput } from "@/lib/monitor-form";
-import { useMonitors, useUpdateMonitor } from "@/lib/queries";
+import { useCheckNow, useMonitors, useUpdateMonitor } from "@/lib/queries";
 import type { Monitor, UptimeStatus } from "@/lib/tauri";
 
 const STATUS_LABELS: Record<UptimeStatus, string> = {
@@ -33,13 +34,22 @@ const STATUS_VARIANTS: Record<
   down: "destructive",
 };
 
-function StatusBadge({ status }: { status: UptimeStatus }) {
-  return <Badge variant={STATUS_VARIANTS[status]}>{STATUS_LABELS[status]}</Badge>;
+function StatusBadge({ monitor }: { monitor: Monitor }) {
+  const status: UptimeStatus = monitor.uptimeStatus;
+  return (
+    <Badge
+      variant={STATUS_VARIANTS[status]}
+      title={monitor.uptimeFailureReason ?? undefined}
+    >
+      {STATUS_LABELS[status]}
+    </Badge>
+  );
 }
 
 export function MonitorsPage() {
   const monitors = useMonitors();
   const updateMonitor = useUpdateMonitor();
+  const checkNow = useCheckNow();
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Monitor | undefined>(undefined);
   const [deleting, setDeleting] = useState<Monitor | null>(null);
@@ -91,11 +101,13 @@ export function MonitorsPage() {
             <TableRow>
               <TableHead>URL</TableHead>
               <TableHead>Status</TableHead>
+              <TableHead>Last check</TableHead>
+              <TableHead>Response</TableHead>
               <TableHead>Interval</TableHead>
               <TableHead>Method</TableHead>
               <TableHead>Certificate</TableHead>
               <TableHead>Enabled</TableHead>
-              <TableHead className="w-24" />
+              <TableHead className="w-32" />
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -103,7 +115,13 @@ export function MonitorsPage() {
               <TableRow key={monitor.id}>
                 <TableCell className="font-medium">{monitor.url}</TableCell>
                 <TableCell>
-                  <StatusBadge status={monitor.uptimeStatus} />
+                  <StatusBadge monitor={monitor} />
+                </TableCell>
+                <TableCell className="text-muted-foreground">
+                  {formatTimeAgo(monitor.lastCheckAt)}
+                </TableCell>
+                <TableCell className="text-muted-foreground">
+                  {formatMs(monitor.lastResponseTimeMs)}
                 </TableCell>
                 <TableCell>{monitor.checkIntervalMinutes} min</TableCell>
                 <TableCell>{monitor.checkMethod}</TableCell>
@@ -119,6 +137,23 @@ export function MonitorsPage() {
                 </TableCell>
                 <TableCell>
                   <div className="flex justify-end gap-1">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      aria-label={`Check ${monitor.url} now`}
+                      disabled={
+                        checkNow.isPending && checkNow.variables === monitor.id
+                      }
+                      onClick={() => checkNow.mutate(monitor.id)}
+                    >
+                      <RefreshCw
+                        className={
+                          checkNow.isPending && checkNow.variables === monitor.id
+                            ? "animate-spin"
+                            : undefined
+                        }
+                      />
+                    </Button>
                     <Button
                       variant="ghost"
                       size="icon"

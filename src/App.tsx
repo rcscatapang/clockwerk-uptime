@@ -2,11 +2,13 @@ import { HashRouter, Route, Routes } from "react-router";
 
 import { AppLayout } from "@/components/app-layout";
 import { Toaster } from "@/components/ui/sonner";
+import { useCheckCompletedInvalidation } from "@/lib/queries";
 import { DashboardPage } from "@/pages/dashboard";
 import { MonitorsPage } from "@/pages/monitors";
 import { SettingsPage } from "@/pages/settings";
 
 export default function App() {
+  useCheckCompletedInvalidation();
   return (
     <HashRouter>
       <Routes>
