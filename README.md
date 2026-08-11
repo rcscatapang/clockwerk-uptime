@@ -1,0 +1,65 @@
+# Uptime Monitor
+
+A macOS menubar desktop app for monitoring HTTP(S) uptime and SSL certificates. Built with Tauri 2 — a Rust core does all the monitoring; a React UI presents it.
+
+> Internal tool. Single-user, local-only data, no server component.
+
+## What it does
+
+- **HTTP(S) uptime checks** — per-monitor interval (default 5 min), GET/HEAD/POST, optional "look for string" body assertion, response-time measurement on every check.
+- **SSL certificate checks** — daily validity/expiry/issuer inspection, warning when a certificate expires within 10 days.
+- **Alerting** — native macOS notifications and Slack (incoming webhook) when a monitor goes down (after 2 consecutive failures), hourly while it stays down, and on recovery.
+- **History & stats** — every check result is stored locally (90-day retention): uptime percentages (24h / 7d / 30d), latency charts, incident timeline.
+- **Honest gaps** — time when the app wasn't running is recorded as a distinct "no data" state, shown gray in charts and excluded from uptime math. Numbers are never fabricated.
+- **Tray-first** — closing the window hides it; monitoring continues in the background. Optional launch-at-login. Quit from the tray menu.
+
+## Architecture
+
+```
+┌─ Tauri app ────────────────────────────────────────────┐
+│  Rust core (owns everything stateful)                  │
+│  ├─ Scheduler: tokio background task, ticks every 30s  │
+│  ├─ Checker: reqwest (HTTP) + SSL cert inspection      │
+│  ├─ Store: rusqlite → app-data-dir/monitor.db (SQLite) │
+│  ├─ Alerter: native notifications + Slack webhook POST │
+│  └─ Secrets: keyring crate → macOS Keychain            │
+│           ▲ Tauri commands + events ▼                  │
+│  React UI — pure viewer/editor, no direct DB/network   │
+└────────────────────────────────────────────────────────┘
+```
+
+Design rules:
+
+- **Single DB owner** — only Rust touches SQLite. The frontend reads and writes exclusively through Tauri commands.
+- **All network I/O in Rust** — the webview makes no HTTP requests of its own.
+- **Secrets in Keychain** — the Slack webhook URL never lands in SQLite and is never sent to the frontend.
+- **Minimal Tauri capabilities** — no shell, no filesystem access from the frontend.
+
+## Stack
+
+| Layer | Choice |
+|---|---|
+| Shell | Tauri 2 |
+| Core | Rust — tokio, reqwest, rusqlite, keyring |
+| UI | React 19, TypeScript, Vite |
+| Styling | Tailwind CSS v4, shadcn/ui |
+| Data fetching | TanStack Query (over Tauri commands, event-invalidated) |
+| Charts | Recharts |
+
+## Development
+
+Prerequisites: Rust (stable, via rustup), Node.js ≥ 22, Xcode Command Line Tools.
+
+```sh
+npm install
+npm run tauri dev     # run the app with hot reload
+npm run tauri build   # produce a local .app / .dmg
+```
+
+CI-style check (no CI is set up yet; run this before committing):
+
+```sh
+npm run build && (cd src-tauri && cargo check)
+```
+
+The SQLite database lives in the app data directory (`~/Library/Application Support/<bundle-id>/monitor.db`).
