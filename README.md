@@ -10,7 +10,7 @@ A macOS menubar desktop app for monitoring HTTP(S) uptime and SSL certificates. 
 - **SSL certificate checks** — daily validity/expiry/issuer inspection, warning when a certificate expires within 10 days.
 - **Alerting** — native macOS notifications and Slack (incoming webhook) when a monitor goes down (after 2 consecutive failures), hourly while it stays down, and on recovery.
 - **History & stats** — every check result is stored locally (90-day retention): uptime percentages (24h / 7d / 30d), latency charts, incident timeline.
-- **Honest gaps** — time when the app wasn't running is recorded as a distinct "no data" state, shown gray in charts and excluded from uptime math. Numbers are never fabricated.
+- **Honest gaps** — on launch, silence longer than twice a monitor's interval is recorded as a distinct "no data" span. Gaps appear gray and are excluded from uptime and downtime totals; history older than 90 days is pruned daily in small batches.
 - **Tray-first** — closing the window hides it; monitoring continues in the background. Optional launch-at-login. Quit from the tray menu.
 
 ## Architecture

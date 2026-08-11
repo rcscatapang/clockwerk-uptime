@@ -188,6 +188,12 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let store = Store::open(&data_dir.join("monitor.db"))
                 .map_err(|e| format!("failed to open monitor.db: {e}"))?;
+            let gap_monitor_ids = store
+                .record_launch_gaps()
+                .map_err(|e| format!("failed to record launch gaps: {e}"))?;
+            if !gap_monitor_ids.is_empty() {
+                tracing::info!(count = gap_monitor_ids.len(), "recorded launch monitoring gaps");
+            }
             app.manage(Arc::new(store));
             app.manage(CheckContext::default());
             engine::start(app.handle().clone());

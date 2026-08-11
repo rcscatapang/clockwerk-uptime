@@ -83,6 +83,8 @@ export interface MonitorInput {
 export interface Settings {
   autostartEnabled: boolean;
   slackWebhookConfigured: boolean;
+  historyRetentionDays: number;
+  lastPruneAt: string | null;
 }
 
 export type HistoryRange = "24h" | "7d" | "30d";
