@@ -1,0 +1,20 @@
+[package]
+name = "uptime-monitor"
+version = "0.1.0"
+description = "macOS menubar app monitoring HTTP(S) uptime and SSL certificates"
+authors = ["Ryan Catapang"]
+edition = "2021"
+
+[lib]
+# The `_lib` suffix keeps the lib name distinct from the bin name (Windows linker quirk).
+name = "uptime_monitor_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
