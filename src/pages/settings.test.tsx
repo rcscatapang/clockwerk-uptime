@@ -78,4 +78,32 @@ describe("SettingsPage alerting", () => {
     await waitFor(() => expect(input).toHaveValue(""));
     expect(await screen.findByText("Configured")).toBeInTheDocument();
   });
+
+  it("removes the configured webhook", async () => {
+    const user = userEvent.setup();
+    getSettingsMock.mockResolvedValue({
+      autostartEnabled: false,
+      slackWebhookConfigured: true,
+    });
+    setSlackWebhookMock.mockResolvedValue({
+      autostartEnabled: false,
+      slackWebhookConfigured: false,
+    });
+    renderSettings();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Remove webhook" }),
+    );
+
+    await waitFor(() => expect(setSlackWebhookMock).toHaveBeenCalledOnce());
+    expect(setSlackWebhookMock.mock.calls[0][0]).toBe("");
+  });
+
+  it("shows notification permission recovery guidance", async () => {
+    renderSettings();
+
+    expect(
+      await screen.findByText(/enable notifications for this app/i),
+    ).toBeInTheDocument();
+  });
 });

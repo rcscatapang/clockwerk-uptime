@@ -57,6 +57,14 @@ export function SettingsPage() {
               }
             />
           </div>
+          <div className="mt-4 border-t pt-4">
+            <p className="text-sm font-medium">Native notifications</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              macOS asks for permission when the first alert is sent. If alerts
+              do not appear, enable notifications for this app in System
+              Settings.
+            </p>
+          </div>
         </CardContent>
       </Card>
       <Card>
@@ -89,7 +97,7 @@ export function SettingsPage() {
                 onChange={(event) => setWebhookUrl(event.target.value)}
               />
               <p className="text-xs text-muted-foreground">
-                Saving replaces the Keychain value without displaying it again.
+                Saving sends a test message before replacing the Keychain value.
               </p>
             </div>
             <div className="flex gap-2">
@@ -99,6 +107,16 @@ export function SettingsPage() {
               >
                 {setSlackWebhook.isPending ? "Saving…" : "Save webhook"}
               </Button>
+              {settings.data?.slackWebhookConfigured && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={setSlackWebhook.isPending}
+                  onClick={() => setSlackWebhook.mutate("")}
+                >
+                  Remove webhook
+                </Button>
+              )}
             </div>
           </form>
         </CardContent>
