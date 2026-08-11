@@ -21,6 +21,7 @@ import { toast } from "sonner";
 import { errorMessage } from "@/lib/errors";
 import * as api from "@/lib/tauri";
 import type {
+  HistoryRange,
   Monitor,
   MonitorInput,
   Settings,
@@ -28,6 +29,20 @@ import type {
 
 export const monitorKeys = {
   all: ["monitors"] as const,
+  detail: (id: number) => ["monitors", id] as const,
+};
+
+export const statsKeys = {
+  all: ["stats"] as const,
+  detail: (id: number) => ["stats", id] as const,
+};
+
+export const historyKeys = {
+  all: ["history"] as const,
+  detail: (id: number, range?: HistoryRange) =>
+    range === undefined
+      ? (["history", id] as const)
+      : (["history", id, range] as const),
 };
 
 export const settingsKeys = {
@@ -36,6 +51,27 @@ export const settingsKeys = {
 
 export function useMonitors() {
   return useQuery({ queryKey: monitorKeys.all, queryFn: api.listMonitors });
+}
+
+export function useMonitor(id: number) {
+  return useQuery({
+    queryKey: monitorKeys.detail(id),
+    queryFn: () => api.getMonitor(id),
+  });
+}
+
+export function useUptimeStats(id: number) {
+  return useQuery({
+    queryKey: statsKeys.detail(id),
+    queryFn: () => api.getUptimeStats(id),
+  });
+}
+
+export function useHistory(id: number, range: HistoryRange) {
+  return useQuery({
+    queryKey: historyKeys.detail(id, range),
+    queryFn: () => api.getHistory(id, range),
+  });
 }
 
 export function useSettings() {
@@ -77,19 +113,40 @@ export function useCreateMonitor(opts?: MutationOpts<Monitor, MonitorInput>) {
 export function useUpdateMonitor(
   opts?: MutationOpts<Monitor, { id: number; input: MonitorInput }>,
 ) {
-  return useInvalidatingMutation(
-    ({ id, input }) => api.updateMonitor(id, input),
-    [monitorKeys.all],
-    opts,
-  );
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, input }: { id: number; input: MonitorInput }) =>
+      api.updateMonitor(id, input),
+    onSuccess: (data, variables, onMutateResult, context) => {
+      queryClient.invalidateQueries({ queryKey: monitorKeys.all });
+      queryClient.invalidateQueries({ queryKey: monitorKeys.detail(data.id) });
+      queryClient.invalidateQueries({ queryKey: statsKeys.detail(data.id) });
+      queryClient.invalidateQueries({ queryKey: historyKeys.detail(data.id) });
+      return opts?.onSuccess?.(data, variables, onMutateResult, context);
+    },
+    onError: (error, variables, onMutateResult, context) => {
+      if (opts?.onError) {
+        return opts.onError(error, variables, onMutateResult, context);
+      }
+      toast.error(errorMessage(error));
+    },
+  });
 }
 
 export function useDeleteMonitor(opts?: MutationOpts<void, number>) {
-  return useInvalidatingMutation(api.deleteMonitor, [monitorKeys.all], opts);
+  return useInvalidatingMutation(api.deleteMonitor, [
+    monitorKeys.all,
+    statsKeys.all,
+    historyKeys.all,
+  ], opts);
 }
 
 export function useCheckNow(opts?: MutationOpts<Monitor, number>) {
-  return useInvalidatingMutation(api.checkNow, [monitorKeys.all], opts);
+  return useInvalidatingMutation(api.checkNow, [
+    monitorKeys.all,
+    statsKeys.all,
+    historyKeys.all,
+  ], opts);
 }
 
 export function useUpdateSettings(opts?: MutationOpts<Settings, Settings>) {
@@ -109,8 +166,13 @@ export function useSetSlackWebhook(
 export function useCheckCompletedInvalidation() {
   const queryClient = useQueryClient();
   useEffect(() => {
-    const unlisten = listen("check-completed", () => {
+    const unlisten = listen<{ monitorIds: number[] }>("check-completed", (event) => {
       queryClient.invalidateQueries({ queryKey: monitorKeys.all });
+      for (const id of event.payload.monitorIds) {
+        queryClient.invalidateQueries({ queryKey: monitorKeys.detail(id) });
+        queryClient.invalidateQueries({ queryKey: statsKeys.detail(id) });
+        queryClient.invalidateQueries({ queryKey: historyKeys.detail(id) });
+      }
     });
     return () => {
       unlisten.then((f) => f());

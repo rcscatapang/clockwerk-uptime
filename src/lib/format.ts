@@ -17,3 +17,20 @@ export function formatMs(ms: number | null): string {
   if (ms < 1000) return `${ms} ms`;
   return `${(ms / 1000).toFixed(1)} s`;
 }
+
+export function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  if (hours < 24) return remainder === 0 ? `${hours}h` : `${hours}h ${remainder}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h`;
+}
+
+export function formatLocalDateTime(iso: string | null): string {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
+}

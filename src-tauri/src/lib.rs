@@ -14,6 +14,7 @@ mod alerter;
 mod checker;
 mod engine;
 mod error;
+mod history;
 mod secrets;
 mod slack;
 mod state;
@@ -30,6 +31,7 @@ use tauri_plugin_autostart::ManagerExt;
 
 use checker::CheckContext;
 use error::AppError;
+use history::{HistoryRange, HistoryResponse, UptimeStats};
 use store::{Monitor, MonitorInput, Settings, Store};
 
 #[tauri::command]
@@ -59,6 +61,20 @@ fn update_monitor(
 #[tauri::command]
 fn delete_monitor(store: State<Arc<Store>>, id: i64) -> Result<(), AppError> {
     store.delete_monitor(id)
+}
+
+#[tauri::command]
+fn get_uptime_stats(store: State<Arc<Store>>, monitor_id: i64) -> Result<UptimeStats, AppError> {
+    store.get_uptime_stats(monitor_id)
+}
+
+#[tauri::command]
+fn get_history(
+    store: State<Arc<Store>>,
+    monitor_id: i64,
+    range: HistoryRange,
+) -> Result<HistoryResponse, AppError> {
+    store.get_history(monitor_id, range)
 }
 
 /// Run a full check for one monitor immediately, outside the schedule.
@@ -154,6 +170,8 @@ pub fn run() {
             create_monitor,
             update_monitor,
             delete_monitor,
+            get_uptime_stats,
+            get_history,
             check_now,
             set_slack_webhook,
             get_settings,
