@@ -3,8 +3,8 @@ import { AppLayout } from "@/components/app-layout";
 import { Button } from "@/components/ui/button";
 import { getSettings, updateSettings } from "@/lib/tauri";
 
-// Placeholder screen for issue 01: proves Tailwind + shadcn/ui render and that
-// the frontend can round-trip a Tauri command (autostart toggle).
+// Placeholder screen: proves Tailwind + shadcn/ui render and that the
+// frontend can round-trip a Tauri command (autostart toggle).
 export default function App() {
   const queryClient = useQueryClient();
 
@@ -20,7 +20,7 @@ export default function App() {
     },
   });
 
-  const autostart = settings.data?.autostart_enabled;
+  const autostart = settings.data?.autostartEnabled;
 
   return (
     <AppLayout>
@@ -35,7 +35,7 @@ export default function App() {
         <Button
           disabled={settings.isPending || toggleAutostart.isPending}
           onClick={() =>
-            toggleAutostart.mutate({ autostart_enabled: !autostart })
+            toggleAutostart.mutate({ autostartEnabled: !autostart })
           }
         >
           {settings.isPending
