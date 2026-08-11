@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 use crate::error::AppError;
 
@@ -255,6 +256,7 @@ fn validate(input: &MonitorInput) -> Result<ValidatedInput, AppError> {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    alerting: AsyncMutex<()>,
 }
 
 impl Store {
@@ -273,6 +275,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let store = Store {
             conn: Mutex::new(conn),
+            alerting: AsyncMutex::new(()),
         };
         store.migrate()?;
         Ok(store)
@@ -400,11 +403,12 @@ impl Store {
 
     /// Apply one check outcome atomically: read the monitor, run the state
     /// machine, update the monitor row, insert the `check_results` row.
-    pub fn record_check(
+    pub async fn record_check(
         &self,
         id: i64,
         outcome: &crate::checker::CheckOutcome,
     ) -> Result<RecordedCheck, AppError> {
+        let _alerting = self.alerting.lock().await;
         self.with_conn(|conn| {
             let tx = conn.transaction()?;
             let monitor = tx.query_row(
@@ -459,19 +463,28 @@ impl Store {
         })
     }
 
+    /// Prevent a monitor transition from racing alert delivery/bookkeeping.
+    /// The lock is global because alert volume is tiny and delivery is already
+    /// sequential; keeping it here gives every check path the same ordering.
+    pub async fn lock_alerting(&self) -> AsyncMutexGuard<'_, ()> {
+        self.alerting.lock().await
+    }
+
     /// Update alert bookkeeping only while the monitor is still in the state
     /// that caused the alert. Returns false when the alert became stale.
     pub fn set_down_alert_sent_at_if_status(
         &self,
         id: i64,
         expected_status: &str,
+        expected_status_changed_at: Option<&str>,
         sent_at: Option<&str>,
     ) -> Result<bool, AppError> {
         self.with_conn(|conn| {
             let changed = conn.execute(
                 "UPDATE monitors SET down_alert_sent_at = ?1
-                 WHERE id = ?2 AND uptime_status = ?3",
-                params![sent_at, id, expected_status],
+                 WHERE id = ?2 AND uptime_status = ?3
+                   AND status_last_change_at IS ?4",
+                params![sent_at, id, expected_status, expected_status_changed_at],
             )?;
             Ok(changed == 1)
         })

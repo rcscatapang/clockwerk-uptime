@@ -99,16 +99,6 @@ export function SettingsPage() {
               >
                 {setSlackWebhook.isPending ? "Saving…" : "Save webhook"}
               </Button>
-              {settings.data?.slackWebhookConfigured && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  disabled={setSlackWebhook.isPending}
-                  onClick={() => setSlackWebhook.mutate("")}
-                >
-                  Clear webhook
-                </Button>
-              )}
             </div>
           </form>
         </CardContent>

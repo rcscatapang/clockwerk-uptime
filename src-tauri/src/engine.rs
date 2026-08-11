@@ -99,7 +99,7 @@ pub async fn run_cycle(
                 &monitor.look_for_string,
             )
             .await;
-            match store.record_check(monitor.id, &outcome) {
+            match store.record_check(monitor.id, &outcome).await {
                 Ok(recorded) => Some(recorded),
                 Err(e) => {
                     tracing::error!(monitor_id = monitor.id, error = %e, "failed to record check");
@@ -136,7 +136,7 @@ pub async fn check_one(
         &monitor.look_for_string,
     )
     .await;
-    store.record_check(id, &outcome)
+    store.record_check(id, &outcome).await
 }
 
 /// Spawn the scheduler loop. Runs for the lifetime of the app, independent

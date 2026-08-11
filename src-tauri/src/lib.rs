@@ -86,7 +86,7 @@ fn settings_with_secrets(store: &Store) -> Result<Settings, AppError> {
     Ok(settings)
 }
 
-/// Set (or clear, with an empty string) the Slack webhook.
+/// Store or replace the Slack webhook without ever returning its value.
 #[tauri::command]
 fn set_slack_webhook(
     store: State<Arc<Store>>,
@@ -94,11 +94,12 @@ fn set_slack_webhook(
 ) -> Result<Settings, AppError> {
     let url = url.trim().to_string();
     if url.is_empty() {
-        secrets::delete_slack_webhook()?;
-    } else {
-        slack::validate_webhook_url(&url)?;
-        secrets::set_slack_webhook(&url)?;
+        return Err(AppError::InvalidInput(
+            "Slack webhook URL is required".into(),
+        ));
     }
+    slack::validate_webhook_url(&url)?;
+    secrets::set_slack_webhook(&url)?;
     settings_with_secrets(store.inner())
 }
 

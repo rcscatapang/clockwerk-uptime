@@ -78,29 +78,4 @@ describe("SettingsPage alerting", () => {
     await waitFor(() => expect(input).toHaveValue(""));
     expect(await screen.findByText("Configured")).toBeInTheDocument();
   });
-
-  it("can clear a configured webhook", async () => {
-    const user = userEvent.setup();
-    getSettingsMock
-      .mockResolvedValueOnce({
-        autostartEnabled: false,
-        slackWebhookConfigured: true,
-      })
-      .mockResolvedValue({
-        autostartEnabled: false,
-        slackWebhookConfigured: false,
-      });
-    setSlackWebhookMock.mockResolvedValue({
-      autostartEnabled: false,
-      slackWebhookConfigured: false,
-    });
-    renderSettings();
-
-    await screen.findByText("Configured");
-    await user.click(screen.getByRole("button", { name: "Clear webhook" }));
-
-    await waitFor(() => expect(setSlackWebhookMock).toHaveBeenCalledOnce());
-    expect(setSlackWebhookMock.mock.calls[0][0]).toBe("");
-    expect(await screen.findByText("Not configured")).toBeInTheDocument();
-  });
 });
