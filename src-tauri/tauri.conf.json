@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Uptime Monitor",
+  "productName": "Clockwerk",
+  "mainBinaryName": "Clockwerk",
   "version": "0.1.0",
-  "identifier": "com.rcscatapang.uptime-monitor",
+  "identifier": "com.rcscatapang.clockwerk",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Uptime Monitor",
+        "title": "Clockwerk",
         "width": 960,
         "height": 640,
         "minWidth": 720,

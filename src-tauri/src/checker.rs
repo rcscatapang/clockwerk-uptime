@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::store::CheckMethod;
 
-pub const USER_AGENT: &str = "tauri-uptime-monitor/1.0";
+pub const USER_AGENT: &str = "clockwerk/1.0";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(100);
 

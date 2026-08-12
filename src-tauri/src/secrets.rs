@@ -1,15 +1,15 @@
 //! Keychain-backed secret storage.
 //!
 //! The Slack webhook URL is the app's only secret. It lives in the macOS
-//! Keychain (service `tauri-uptime-monitor`), never in SQLite, is never
-//! logged, and is never returned to the frontend — commands expose only a
+//! Keychain (service `clockwerk`), never in SQLite, is never logged, and is
+//! never returned to the frontend — commands expose only a
 //! configured/not-configured flag.
 
 use keyring::Entry;
 
 use crate::error::AppError;
 
-const SERVICE: &str = "tauri-uptime-monitor";
+const SERVICE: &str = "clockwerk";
 const SLACK_WEBHOOK_ENTRY: &str = "slack_webhook_url";
 
 fn entry() -> Result<Entry, AppError> {

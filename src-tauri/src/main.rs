@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    uptime_monitor_lib::run()
+    clockwerk_lib::run()
 }

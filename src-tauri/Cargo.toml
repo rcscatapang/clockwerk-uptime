@@ -1,13 +1,18 @@
 [package]
-name = "uptime-monitor"
+name = "clockwerk"
 version = "0.1.0"
 description = "macOS menubar app monitoring HTTP(S) uptime and SSL certificates"
 authors = ["Ryan Catapang"]
 edition = "2021"
+autobins = false
+
+[[bin]]
+name = "Clockwerk"
+path = "src/main.rs"
 
 [lib]
 # The `_lib` suffix keeps the lib name distinct from the bin name (Windows linker quirk).
-name = "uptime_monitor_lib"
+name = "clockwerk_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -33,3 +38,9 @@ x509-parser = "0.18"
 
 [dev-dependencies]
 httpmock = "0.7"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "s"
