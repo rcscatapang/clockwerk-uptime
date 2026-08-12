@@ -24,7 +24,8 @@ mod store;
 use std::sync::Arc;
 
 use tauri::{
-    menu::{Menu, MenuItem},
+    image::Image,
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
     Emitter, Manager, State,
 };
@@ -199,11 +200,14 @@ pub fn run() {
             engine::start(app.handle().clone());
 
             let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let separator = PredefinedMenuItem::separator(app)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit Clockwerk", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &separator, &quit])?;
 
             TrayIconBuilder::with_id("main-tray")
-                .icon(app.default_window_icon().expect("bundled icon").clone())
+                // The app icon flattens to a blob once templated at this size.
+                .icon(Image::from_bytes(include_bytes!("../icons/tray@2x.png"))?)
+                .tooltip("Clockwerk — Uptime & SSL Monitoring")
                 // macOS-only hint: render the icon as a monochrome template so it
                 // matches the menubar theme. No-op on other platforms.
                 .icon_as_template(true)

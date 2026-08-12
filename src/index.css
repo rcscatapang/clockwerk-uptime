@@ -3,48 +3,58 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
+  --brand-ink: oklch(0.247 0.031 273);
+  --brand-brass: oklch(0.751 0.13 80);
+  --brand-orange: oklch(0.71 0.166 53);
+  --brand-cream: oklch(0.928 0.01 88);
+
+  --background: oklch(0.994 0.002 273);
+  --foreground: oklch(0.247 0.031 273);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
+  --card-foreground: oklch(0.247 0.031 273);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.247 0.031 273);
+  --primary: oklch(0.28 0.055 273);
+  --primary-foreground: oklch(0.985 0.004 88);
+  --secondary: oklch(0.966 0.005 273);
+  --secondary-foreground: oklch(0.28 0.055 273);
+  --muted: oklch(0.966 0.005 273);
+  --muted-foreground: oklch(0.552 0.022 273);
+  --accent: oklch(0.955 0.008 273);
+  --accent-foreground: oklch(0.28 0.055 273);
   --destructive: oklch(0.577 0.245 27.325);
   --destructive-foreground: oklch(0.985 0 0);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  --border: oklch(0.916 0.008 273);
+  --input: oklch(0.916 0.008 273);
+  --ring: oklch(0.751 0.13 80);
   --radius: 0.625rem;
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
+  --brand-ink: oklch(0.247 0.031 273);
+  --brand-brass: oklch(0.79 0.128 82);
+  --brand-orange: oklch(0.735 0.16 55);
+  --brand-cream: oklch(0.928 0.01 88);
+
+  --background: oklch(0.185 0.022 273);
+  --foreground: oklch(0.945 0.006 88);
+  --card: oklch(0.232 0.026 273);
+  --card-foreground: oklch(0.945 0.006 88);
+  --popover: oklch(0.232 0.026 273);
+  --popover-foreground: oklch(0.945 0.006 88);
+  --primary: oklch(0.565 0.088 273);
+  --primary-foreground: oklch(0.975 0.005 88);
+  --secondary: oklch(0.295 0.026 273);
+  --secondary-foreground: oklch(0.945 0.006 88);
+  --muted: oklch(0.295 0.026 273);
+  --muted-foreground: oklch(0.715 0.018 273);
+  --accent: oklch(0.32 0.03 273);
+  --accent-foreground: oklch(0.945 0.006 88);
   --destructive: oklch(0.704 0.191 22.216);
   --destructive-foreground: oklch(0.985 0 0);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
+  --border: oklch(0.945 0.006 88 / 12%);
+  --input: oklch(0.945 0.006 88 / 16%);
+  --ring: oklch(0.79 0.128 82);
 }
 
 @theme inline {
@@ -67,6 +77,19 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+
+  --color-brand-ink: var(--brand-ink);
+  --color-brand-brass: var(--brand-brass);
+  --color-brand-orange: var(--brand-orange);
+  --color-brand-cream: var(--brand-cream);
+
+  --font-sans:
+    "Avenir Next", "Segoe UI Variable Text", "Segoe UI", system-ui,
+    -apple-system, sans-serif;
+  --font-mono:
+    "SF Mono", ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo,
+    monospace;
+
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -78,6 +101,8 @@
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background text-foreground antialiased;
+    @apply bg-background font-sans text-foreground antialiased;
+    /* Stops refreshing latency and uptime digits reflowing on every poll. */
+    font-variant-numeric: tabular-nums;
   }
 }
