@@ -21,6 +21,7 @@ import { toast } from "sonner";
 import { errorMessage } from "@/lib/errors";
 import * as api from "@/lib/tauri";
 import type {
+  CheckSummary,
   HistoryRange,
   Monitor,
   MonitorInput,
@@ -145,6 +146,38 @@ export function useDeleteMonitor(opts?: MutationOpts<void, number>) {
     statsKeys.all,
     historyKeys.all,
   ], opts);
+}
+
+/** Bulk enable/disable. Touches `uptimeCheckEnabled` only. */
+export function useSetMonitorsEnabled(
+  opts?: MutationOpts<number, { ids: number[]; enabled: boolean }>,
+) {
+  return useInvalidatingMutation(
+    ({ ids, enabled }: { ids: number[]; enabled: boolean }) =>
+      api.setMonitorsEnabled(ids, enabled),
+    [monitorKeys.all],
+    opts,
+  );
+}
+
+export function useDeleteMonitors(opts?: MutationOpts<number, number[]>) {
+  return useInvalidatingMutation(
+    api.deleteMonitors,
+    [monitorKeys.all, statsKeys.all, historyKeys.all],
+    opts,
+  );
+}
+
+/**
+ * Force a check of the given monitors. The backend also emits
+ * `check-completed`, so rows refresh through the usual event path too.
+ */
+export function useCheckMonitors(opts?: MutationOpts<CheckSummary, number[]>) {
+  return useInvalidatingMutation(
+    api.checkMonitors,
+    [monitorKeys.all, statsKeys.all, historyKeys.all],
+    opts,
+  );
 }
 
 export function useCheckNow(opts?: MutationOpts<Monitor, number>) {

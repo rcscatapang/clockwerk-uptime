@@ -141,6 +141,28 @@ export function deleteMonitor(id: number): Promise<void> {
   return invoke<void>("delete_monitor", { id });
 }
 
+export interface CheckSummary {
+  checked: number;
+  up: number;
+  down: number;
+}
+
+export function setMonitorsEnabled(
+  ids: number[],
+  enabled: boolean,
+): Promise<number> {
+  return invoke<number>("set_monitors_enabled", { ids, enabled });
+}
+
+export function deleteMonitors(ids: number[]): Promise<number> {
+  return invoke<number>("delete_monitors", { ids });
+}
+
+/** Check exactly these monitors now, schedule and enabled flag ignored. */
+export function checkMonitors(ids: number[]): Promise<CheckSummary> {
+  return invoke<CheckSummary>("check_monitors", { ids });
+}
+
 export function checkNow(id: number): Promise<Monitor> {
   return invoke<Monitor>("check_now", { id });
 }

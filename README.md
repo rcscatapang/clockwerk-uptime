@@ -28,6 +28,7 @@ A macOS menubar desktop app for monitoring HTTP(S) uptime and SSL certificates. 
 - **Alerting**: native macOS notifications and Slack (incoming webhook) when a monitor goes down (after 2 consecutive failures), hourly while it stays down, and on recovery.
 - **History & stats**: every check result is stored locally (90-day retention). Uptime percentages (24h / 7d / 30d), latency charts, incident timeline.
 - **Honest gaps**: on launch, silence longer than twice a monitor's interval is recorded as a distinct "no data" span. Gaps appear gray and are excluded from uptime and downtime totals; history older than 90 days is pruned daily in small batches.
+- **Bulk actions**: select rows on the Monitors page to enable, disable, or delete many monitors at once, and force an immediate check. "Check all now" checks every enabled monitor regardless of its interval; "Check selected now" checks exactly what you picked, disabled monitors included, and leaves them disabled.
 - **Tray-first**: closing the window hides it; monitoring continues in the background. Optional launch-at-login. Quit from the tray menu.
 
 ## Architecture
