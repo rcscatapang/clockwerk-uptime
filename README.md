@@ -11,6 +11,16 @@ A macOS menubar desktop app for monitoring HTTP(S) uptime and SSL certificates. 
 
 > Internal tool. Single-user, local-only data, no server component.
 
+<p align="center">
+  <img src="docs/screenshots/dashboard.png" alt="Clockwerk dashboard: uptime percentages and latency sparklines for five monitors, one down" width="900">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/monitors.png" alt="Clockwerk monitors list: URL, status, last check, response time, interval, method, and certificate state per monitor" width="900">
+  <br>
+  <em>Dashboard gives you a quick overview of your uptime and service health, while Monitors provides detailed status for each monitor.</em>
+</p>
+
 ## What it does
 
 - **HTTP(S) uptime checks**: per-monitor interval (default 5 min), GET/HEAD/POST, optional "look for string" body assertion, response-time measurement on every check.
