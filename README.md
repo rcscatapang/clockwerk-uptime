@@ -50,7 +50,7 @@ Design rules:
 - **Single DB owner**: only Rust touches SQLite. The frontend reads and writes exclusively through Tauri commands.
 - **All network I/O in Rust**: the webview makes no HTTP requests of its own.
 - **Secrets in Keychain**: the Slack webhook URL never lands in SQLite and is never sent to the frontend.
-- **Minimal Tauri capabilities**: no shell, no filesystem access from the frontend.
+- **Minimal Tauri capabilities**: no shell, no filesystem access from the frontend. The file-open dialog is the sole exception, and it only hands a path to Rust, which does the reading.
 
 ## Alerting behavior
 
@@ -69,6 +69,36 @@ macOS Keychain; removing it leaves native alerts enabled.
 Certificate checks run daily for enabled HTTPS monitors and immediately on the
 first scheduler tick after creation or enabling. They use the platform trust
 store and retain the leaf certificate's issuer and expiry when available.
+
+## Bulk import / sync
+
+Monitors → **Import / Sync** picks a JSON file, previews what it would change,
+and applies it only after you confirm. The file is a JSON array whose legal
+keys are exactly the editable monitor fields; `url` is required and every other
+key is optional. Unknown keys are rejected rather than imported, and status or
+history columns can never be written this way.
+
+```json
+[
+  { "url": "https://example.com" },
+  {
+    "url": "https://api.example.com/health",
+    "uptime_check_enabled": true,
+    "check_interval_minutes": 15,
+    "check_method": "POST",
+    "look_for_string": "\"status\":\"ok\"",
+    "cert_check_enabled": true
+  }
+]
+```
+
+`url` is the key the sync matches on. An entry with no matching monitor is
+created; an entry that matches one is merge-updated, so keys you leave out keep
+their current values. Monitors missing from the file are deleted only when you
+turn on "Delete monitors missing from the file" in the preview, and deleting a
+monitor removes its check history with it. The whole run is validated first: a
+bad entry aborts everything with a message naming the entry, and nothing is
+written.
 
 ## Stack
 
