@@ -18,6 +18,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { certificateState } from "@/lib/certificate";
 import { errorMessage } from "@/lib/errors";
 import { formatMs, formatTimeAgo } from "@/lib/format";
 import { monitorToInput } from "@/lib/monitor-form";
@@ -59,25 +60,25 @@ function StatusBadge({ monitor }: { monitor: Monitor }) {
 }
 
 function CertificateBadge({ monitor }: { monitor: Monitor }) {
-  if (!monitor.certCheckEnabled) return <span>Off</span>;
-  if (monitor.certStatus === "invalid") {
-    return <Badge variant="destructive">Certificate issue</Badge>;
+  const state = certificateState(monitor);
+  switch (state.kind) {
+    case "disabled":
+      return <span>Off</span>;
+    case "not_checked":
+      return <span>Not checked</span>;
+    case "invalid":
+      return <Badge variant="destructive">Certificate issue</Badge>;
+    case "expired":
+      return <Badge variant="destructive">Expired</Badge>;
+    case "expiring_soon":
+      return (
+        <Badge variant="outline" className="border-amber-500 text-amber-700">
+          Expires in {state.daysRemaining}d
+        </Badge>
+      );
+    case "valid":
+      return <span>Valid</span>;
   }
-  if (monitor.certStatus === "not_yet_checked") {
-    return <span>Not checked</span>;
-  }
-  const expiresAt = monitor.certExpiresAt
-    ? new Date(monitor.certExpiresAt).getTime()
-    : Number.NaN;
-  const daysRemaining = Math.ceil((expiresAt - Date.now()) / 86_400_000);
-  if (Number.isFinite(daysRemaining) && daysRemaining <= 10) {
-    return (
-      <Badge variant="outline" className="border-amber-500 text-amber-700">
-        Expires in {Math.max(0, daysRemaining)}d
-      </Badge>
-    );
-  }
-  return <span>Valid</span>;
 }
 
 export function MonitorsPage() {

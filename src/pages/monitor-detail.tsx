@@ -25,6 +25,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { certificateState } from "@/lib/certificate";
 import { formatDuration, formatLocalDateTime, formatMs } from "@/lib/format";
 import { useCheckNow, useHistory, useMonitor, useUptimeStats } from "@/lib/queries";
 import type { HistoryPoint, HistoryRange, Monitor, UptimeStatus } from "@/lib/tauri";
@@ -140,22 +141,20 @@ function LatencyChart({ points }: { points: HistoryPoint[] }) {
 }
 
 function CertificatePanel({ monitor }: { monitor: Monitor }) {
-  if (!monitor.certCheckEnabled) {
+  const state = certificateState(monitor);
+  if (state.kind === "disabled") {
     return <p className="text-sm text-muted-foreground">Certificate checks are disabled.</p>;
   }
-  if (monitor.certStatus === "not_yet_checked") {
+  if (state.kind === "not_checked") {
     return <p className="text-sm text-muted-foreground">Not checked yet</p>;
   }
-  const expiry = monitor.certExpiresAt ? new Date(monitor.certExpiresAt) : null;
-  const daysRemaining = expiry
-    ? Math.ceil((expiry.getTime() - Date.now()) / 86_400_000)
-    : null;
+  const expiry = state.expiresAt;
   return (
     <dl className="grid gap-4 text-sm sm:grid-cols-3">
       <div>
         <dt className="text-muted-foreground">Status</dt>
-        <dd className={cn("mt-1 font-medium", monitor.certStatus === "invalid" && "text-destructive")}>
-          {monitor.certStatus === "valid" ? "Valid" : "Invalid"}
+        <dd className={cn("mt-1 font-medium", state.kind === "invalid" && "text-destructive")}>
+          {state.kind === "invalid" ? "Invalid" : "Valid"}
         </dd>
       </div>
       <div>
@@ -167,12 +166,13 @@ function CertificatePanel({ monitor }: { monitor: Monitor }) {
         <dd
           className={cn(
             "mt-1 font-medium",
-            daysRemaining !== null && daysRemaining <= 10 && "text-amber-600",
-            daysRemaining !== null && daysRemaining < 0 && "text-destructive",
+            state.kind === "expiring_soon" && "text-amber-600",
+            state.kind === "expired" && "text-destructive",
           )}
         >
           {expiry ? expiry.toLocaleDateString() : "—"}
-          {daysRemaining !== null && ` · ${daysRemaining} days`}
+          {state.kind === "expiring_soon" && ` · ${state.daysRemaining} days`}
+          {state.kind === "expired" && ` · expired ${state.daysAgo} days ago`}
         </dd>
       </div>
       {monitor.certFailureReason && (
