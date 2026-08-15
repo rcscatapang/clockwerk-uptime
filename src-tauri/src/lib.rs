@@ -90,6 +90,65 @@ fn apply_monitor_sync(
     store.apply_monitor_sync(&entries, delete_missing)
 }
 
+/// Enable or disable uptime checking for a selection. Certificate checking is
+/// deliberately untouched: the two toggles are independent.
+#[tauri::command]
+fn set_monitors_enabled(
+    store: State<Arc<Store>>,
+    ids: Vec<i64>,
+    enabled: bool,
+) -> Result<usize, AppError> {
+    store.set_monitors_enabled(&ids, enabled)
+}
+
+#[tauri::command]
+fn delete_monitors(store: State<Arc<Store>>, ids: Vec<i64>) -> Result<usize, AppError> {
+    store.delete_monitors(&ids)
+}
+
+/// Outcome of a forced check run, for the result toast.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckSummary {
+    checked: usize,
+    up: usize,
+    down: usize,
+}
+
+/// Check exactly these monitors now. The caller decides the scope: the UI
+/// sends enabled monitors for "check all" and the raw selection for "check
+/// selected", so an explicitly selected monitor is never silently skipped.
+#[tauri::command]
+async fn check_monitors(
+    app: tauri::AppHandle,
+    store: State<'_, Arc<Store>>,
+    ctx: State<'_, CheckContext>,
+    ids: Vec<i64>,
+) -> Result<CheckSummary, AppError> {
+    let recorded = engine::check_many(store.inner(), &ctx.client, &ctx.config, &ids).await?;
+    for check in &recorded {
+        alerter::handle_check(&app, store.inner(), check).await;
+    }
+    let monitor_ids: Vec<i64> = recorded.iter().map(|check| check.after.id).collect();
+    if !monitor_ids.is_empty() {
+        let _ = app.emit(
+            engine::CHECK_COMPLETED_EVENT,
+            engine::CheckCompletedPayload { monitor_ids },
+        );
+    }
+    // A failing check leaves the monitor with failures on the clock even
+    // before it crosses the down threshold, so count the check, not the state.
+    let up = recorded
+        .iter()
+        .filter(|check| check.after.consecutive_failures == 0)
+        .count();
+    Ok(CheckSummary {
+        checked: recorded.len(),
+        up,
+        down: recorded.len() - up,
+    })
+}
+
 #[tauri::command]
 fn get_uptime_stats(store: State<Arc<Store>>, monitor_id: i64) -> Result<UptimeStats, AppError> {
     store.get_uptime_stats(monitor_id)
@@ -201,6 +260,9 @@ pub fn run() {
             create_monitor,
             update_monitor,
             delete_monitor,
+            set_monitors_enabled,
+            delete_monitors,
+            check_monitors,
             preview_monitor_sync,
             apply_monitor_sync,
             get_uptime_stats,

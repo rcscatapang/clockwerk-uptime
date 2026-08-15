@@ -420,15 +420,56 @@ impl Store {
         })
     }
 
-    pub fn delete_monitor(&self, id: i64) -> Result<(), AppError> {
+    /// Load the given monitors, failing if any id is unknown. Bulk callers use
+    /// this to validate a selection before acting on it.
+    pub fn get_monitors(&self, ids: &[i64]) -> Result<Vec<Monitor>, AppError> {
+        self.with_conn(|conn| ids.iter().map(|id| get_monitor_inner(conn, *id)).collect())
+    }
+
+    /// Flip `uptime_check_enabled` for every id, in one transaction. Nothing
+    /// else is touched — `cert_check_enabled` in particular keeps its value.
+    pub fn set_monitors_enabled(&self, ids: &[i64], enabled: bool) -> Result<usize, AppError> {
         self.with_conn(|conn| {
-            // check_results rows go with it via ON DELETE CASCADE.
-            let changed = conn.execute("DELETE FROM monitors WHERE id = ?1", params![id])?;
-            if changed == 0 {
-                return Err(AppError::NotFound);
+            let tx = conn.transaction()?;
+            let now = now_utc();
+            let mut changed = 0;
+            for id in ids {
+                let updated = tx.execute(
+                    "UPDATE monitors SET uptime_check_enabled = ?1, updated_at = ?2
+                     WHERE id = ?3",
+                    params![enabled, now, id],
+                )?;
+                if updated == 0 {
+                    return Err(AppError::NotFound);
+                }
+                changed += updated;
             }
-            Ok(())
+            tx.commit()?;
+            Ok(changed)
         })
+    }
+
+    /// Delete every id, in one transaction. An unknown id aborts the whole
+    /// batch rather than deleting part of the selection.
+    pub fn delete_monitors(&self, ids: &[i64]) -> Result<usize, AppError> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            let mut deleted = 0;
+            for id in ids {
+                // check_results rows go with them via ON DELETE CASCADE.
+                let removed = tx.execute("DELETE FROM monitors WHERE id = ?1", params![id])?;
+                if removed == 0 {
+                    return Err(AppError::NotFound);
+                }
+                deleted += removed;
+            }
+            tx.commit()?;
+            Ok(deleted)
+        })
+    }
+
+    pub fn delete_monitor(&self, id: i64) -> Result<(), AppError> {
+        self.delete_monitors(&[id]).map(|_| ())
     }
 
     // --- JSON sync ----------------------------------------------------------
@@ -1947,6 +1988,78 @@ mod tests {
         }
 
         assert!(started.elapsed() < StdDuration::from_secs(1));
+    }
+
+    #[test]
+    fn bulk_enable_round_trip_leaves_certificate_flags_alone() {
+        let store = Store::open_in_memory().unwrap();
+        let https = store.create_monitor(&input("https://secure.test")).unwrap();
+        let http = store.create_monitor(&input("http://plain.test")).unwrap();
+        assert!(https.cert_check_enabled);
+        assert!(!http.cert_check_enabled);
+        let ids = [https.id, http.id];
+
+        assert_eq!(store.set_monitors_enabled(&ids, false).unwrap(), 2);
+        for id in ids {
+            assert!(!store.get_monitor(id).unwrap().uptime_check_enabled);
+        }
+        assert_eq!(store.set_monitors_enabled(&ids, true).unwrap(), 2);
+        for id in ids {
+            assert!(store.get_monitor(id).unwrap().uptime_check_enabled);
+        }
+
+        // The independent toggle survived both passes.
+        assert!(store.get_monitor(https.id).unwrap().cert_check_enabled);
+        assert!(!store.get_monitor(http.id).unwrap().cert_check_enabled);
+    }
+
+    #[test]
+    fn bulk_delete_removes_history_and_rejects_unknown_ids() {
+        let store = Store::open_in_memory().unwrap();
+        let first = store.create_monitor(&input("https://a.test")).unwrap();
+        let second = store.create_monitor(&input("https://b.test")).unwrap();
+        insert_result(&store, first.id, Utc::now(), "up", Some(90), None);
+        insert_result(&store, second.id, Utc::now(), "up", Some(90), None);
+
+        // An unknown id aborts the batch: the real ids in it survive.
+        let err = store
+            .delete_monitors(&[first.id, first.id + second.id + 99])
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound));
+        assert_eq!(store.list_monitors().unwrap().len(), 2);
+
+        assert_eq!(store.delete_monitors(&[first.id, second.id]).unwrap(), 2);
+        assert!(store.list_monitors().unwrap().is_empty());
+        let remaining: i64 = store
+            .with_conn(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM check_results", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn bulk_enable_rejects_unknown_ids_without_changing_anything() {
+        let store = Store::open_in_memory().unwrap();
+        let monitor = store.create_monitor(&input("https://a.test")).unwrap();
+
+        let err = store
+            .set_monitors_enabled(&[monitor.id, monitor.id + 99], false)
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound));
+        assert!(store.get_monitor(monitor.id).unwrap().uptime_check_enabled);
+    }
+
+    #[test]
+    fn get_monitors_validates_every_id() {
+        let store = Store::open_in_memory().unwrap();
+        let monitor = store.create_monitor(&input("https://a.test")).unwrap();
+
+        assert_eq!(store.get_monitors(&[monitor.id]).unwrap().len(), 1);
+        assert!(matches!(
+            store.get_monitors(&[monitor.id, monitor.id + 5]),
+            Err(AppError::NotFound)
+        ));
     }
 
     fn entries(json: &str) -> Vec<SyncEntry> {

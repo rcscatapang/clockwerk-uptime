@@ -86,13 +86,24 @@ pub async fn run_cycle(
         .into_iter()
         .filter(|m| is_due(m, now))
         .collect();
-    if due.is_empty() {
-        return Ok(Vec::new());
-    }
+    Ok(check_concurrently(store, client, config, due).await)
+}
 
+/// Check every monitor once, `MAX_IN_FLIGHT` at a time. Shared by the
+/// scheduler and by forced checks so both obey the same cap, timeout, and
+/// recording path (and therefore the same state machine).
+async fn check_concurrently(
+    store: &Arc<Store>,
+    client: &reqwest::Client,
+    config: &CheckConfig,
+    monitors: Vec<Monitor>,
+) -> Vec<RecordedCheck> {
+    if monitors.is_empty() {
+        return Vec::new();
+    }
     let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
-    let mut handles = Vec::with_capacity(due.len());
-    for monitor in due {
+    let mut handles = Vec::with_capacity(monitors.len());
+    for monitor in monitors {
         let semaphore = semaphore.clone();
         let store = store.clone();
         let client = client.clone();
@@ -125,7 +136,20 @@ pub async fn run_cycle(
             Err(e) => tracing::error!(error = %e, "check task panicked"),
         }
     }
-    Ok(checked)
+    checked
+}
+
+/// Check exactly these monitors immediately, whatever their schedule says. An
+/// unknown id fails the whole call; a disabled monitor is checked when it was
+/// asked for by id, and stays disabled — a one-off check is not an enable.
+pub async fn check_many(
+    store: &Arc<Store>,
+    client: &reqwest::Client,
+    config: &CheckConfig,
+    ids: &[i64],
+) -> Result<Vec<RecordedCheck>, AppError> {
+    let monitors = store.get_monitors(ids)?;
+    Ok(check_concurrently(store, client, config, monitors).await)
 }
 
 /// Check a single monitor immediately, outside the schedule.
@@ -450,6 +474,75 @@ mod tests {
         let bad_after = store.get_monitor(bad.id).unwrap();
         assert_eq!(bad_after.uptime_status, "down");
         assert_eq!(bad_after.uptime_failure_reason.as_deref(), Some("HTTP 500"));
+    }
+
+    #[tokio::test]
+    async fn forced_checks_run_disabled_monitors_and_leave_them_disabled() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/ok");
+            then.status(200);
+        });
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut disabled = input(&server.url("/ok"));
+        disabled.uptime_check_enabled = false;
+        let monitor = store.create_monitor(&disabled).unwrap();
+
+        let config = CheckConfig {
+            timeout: Duration::from_millis(500),
+            retry_delay: Duration::from_millis(10),
+        };
+        let client = checker::build_client(&config);
+
+        // The scheduler skips it, an explicit selection does not.
+        assert!(run_cycle(&store, &client, &config).await.unwrap().is_empty());
+        let checked = check_many(&store, &client, &config, &[monitor.id])
+            .await
+            .unwrap();
+        assert_eq!(checked.len(), 1);
+
+        let after = store.get_monitor(monitor.id).unwrap();
+        assert_eq!(after.uptime_status, "up");
+        assert!(!after.uptime_check_enabled, "a one-off check must not enable");
+
+        // An unknown id fails the whole call.
+        assert!(matches!(
+            check_many(&store, &client, &config, &[monitor.id + 99]).await,
+            Err(AppError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_forced_check_that_fails_drives_the_normal_transition_and_alert() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/bad");
+            then.status(500);
+        });
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let monitor = store.create_monitor(&input(&server.url("/bad"))).unwrap();
+        let config = CheckConfig {
+            timeout: Duration::from_millis(500),
+            retry_delay: Duration::from_millis(10),
+        };
+        let client = checker::build_client(&config);
+
+        // One failure is suspicion; the alerter stays quiet.
+        let first = check_many(&store, &client, &config, &[monitor.id])
+            .await
+            .unwrap();
+        assert!(crate::alerter::decide_after_check(&first[0], Utc::now()).is_none());
+
+        // The second crosses the threshold: same state machine, same alert.
+        let second = check_many(&store, &client, &config, &[monitor.id])
+            .await
+            .unwrap();
+        assert_eq!(store.get_monitor(monitor.id).unwrap().uptime_status, "down");
+        let alert = crate::alerter::decide_after_check(&second[0], Utc::now())
+            .expect("a forced check crossing the threshold must alert");
+        assert_eq!(alert.monitor_id, monitor.id);
     }
 
     #[tokio::test]
