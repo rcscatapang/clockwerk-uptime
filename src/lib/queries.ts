@@ -25,6 +25,7 @@ import type {
   Monitor,
   MonitorInput,
   Settings,
+  SyncResult,
 } from "@/lib/tauri";
 
 export const monitorKeys = {
@@ -47,6 +48,11 @@ export const historyKeys = {
 
 export const settingsKeys = {
   all: ["settings"] as const,
+};
+
+export const syncKeys = {
+  preview: (path: string | null, deleteMissing: boolean) =>
+    ["monitor-sync-preview", path, deleteMissing] as const,
 };
 
 export function useMonitors() {
@@ -147,6 +153,37 @@ export function useCheckNow(opts?: MutationOpts<Monitor, number>) {
     statsKeys.all,
     historyKeys.all,
   ], opts);
+}
+
+/**
+ * Preview a sync file. The backend writes nothing here, so this is a plain
+ * query: the file and the delete-missing toggle are its only inputs, and the
+ * dialog shows its error itself rather than as a toast. Never cached — the
+ * file can change on disk between openings.
+ */
+export function useMonitorSyncPreview(
+  path: string | null,
+  deleteMissing: boolean,
+) {
+  return useQuery({
+    queryKey: syncKeys.preview(path, deleteMissing),
+    queryFn: () => api.previewMonitorSync(path as string, deleteMissing),
+    enabled: path !== null,
+    gcTime: 0,
+    staleTime: 0,
+    retry: false,
+  });
+}
+
+export function useApplyMonitorSync(
+  opts?: MutationOpts<SyncResult, { path: string; deleteMissing: boolean }>,
+) {
+  return useInvalidatingMutation(
+    ({ path, deleteMissing }: { path: string; deleteMissing: boolean }) =>
+      api.applyMonitorSync(path, deleteMissing),
+    [monitorKeys.all, statsKeys.all, historyKeys.all],
+    opts,
+  );
 }
 
 export function useUpdateSettings(opts?: MutationOpts<Settings, Settings>) {

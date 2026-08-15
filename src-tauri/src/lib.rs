@@ -20,6 +20,7 @@ mod secrets;
 mod slack;
 mod state;
 mod store;
+mod sync;
 
 use std::sync::Arc;
 
@@ -35,6 +36,7 @@ use checker::CheckContext;
 use error::AppError;
 use history::{HistoryRange, HistoryResponse, UptimeStats};
 use store::{Monitor, MonitorInput, Settings, Store};
+use sync::{SyncPlan, SyncResult};
 
 #[tauri::command]
 fn list_monitors(store: State<Arc<Store>>) -> Result<Vec<Monitor>, AppError> {
@@ -63,6 +65,29 @@ fn update_monitor(
 #[tauri::command]
 fn delete_monitor(store: State<Arc<Store>>, id: i64) -> Result<(), AppError> {
     store.delete_monitor(id)
+}
+
+/// Validate a sync file and report the diff without writing anything.
+#[tauri::command]
+fn preview_monitor_sync(
+    store: State<Arc<Store>>,
+    path: String,
+    delete_missing: bool,
+) -> Result<SyncPlan, AppError> {
+    let entries = sync::read_entries(std::path::Path::new(&path))?;
+    store.preview_monitor_sync(&entries, delete_missing)
+}
+
+/// Re-read the file and apply it. The file is the truth at apply time: if it
+/// changed since the preview, this run's own validation and diff decide.
+#[tauri::command]
+fn apply_monitor_sync(
+    store: State<Arc<Store>>,
+    path: String,
+    delete_missing: bool,
+) -> Result<SyncResult, AppError> {
+    let entries = sync::read_entries(std::path::Path::new(&path))?;
+    store.apply_monitor_sync(&entries, delete_missing)
 }
 
 #[tauri::command]
@@ -169,12 +194,15 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             list_monitors,
             get_monitor,
             create_monitor,
             update_monitor,
             delete_monitor,
+            preview_monitor_sync,
+            apply_monitor_sync,
             get_uptime_stats,
             get_history,
             check_now,

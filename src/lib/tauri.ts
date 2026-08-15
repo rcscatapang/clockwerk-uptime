@@ -17,6 +17,7 @@
 //   Internal     — an OS-level operation failed (e.g. autostart registration)
 
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 
 export type AppErrorCode =
   | "InvalidUrl"
@@ -153,6 +154,60 @@ export function getHistory(
   range: HistoryRange,
 ): Promise<HistoryResponse> {
   return invoke<HistoryResponse>("get_history", { monitorId, range });
+}
+
+/**
+ * Sync file format, mirroring `SyncEntry` in src-tauri/src/sync.rs — the legal
+ * keys of an import file, snake_cased as they appear in the JSON. Rust is the
+ * validating authority; this type documents the contract for the UI.
+ */
+export interface SyncFileEntry {
+  url: string;
+  uptime_check_enabled?: boolean;
+  check_interval_minutes?: number;
+  check_method?: CheckMethod;
+  look_for_string?: string;
+  cert_check_enabled?: boolean;
+}
+
+export interface SyncPlan {
+  deleteMissing: boolean;
+  toAdd: string[];
+  toUpdate: string[];
+  toDelete: string[];
+  unchanged: string[];
+}
+
+export interface SyncResult {
+  added: number;
+  updated: number;
+  deleted: number;
+  unchanged: number;
+}
+
+/** Native file-open dialog. Returns the chosen path, or null if cancelled. */
+export async function pickMonitorSyncFile(): Promise<string | null> {
+  const selected = await open({
+    multiple: false,
+    directory: false,
+    title: "Import monitors from JSON",
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+export function previewMonitorSync(
+  path: string,
+  deleteMissing: boolean,
+): Promise<SyncPlan> {
+  return invoke<SyncPlan>("preview_monitor_sync", { path, deleteMissing });
+}
+
+export function applyMonitorSync(
+  path: string,
+  deleteMissing: boolean,
+): Promise<SyncResult> {
+  return invoke<SyncResult>("apply_monitor_sync", { path, deleteMissing });
 }
 
 export function getSettings(): Promise<Settings> {

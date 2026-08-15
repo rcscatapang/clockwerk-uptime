@@ -24,6 +24,7 @@ use crate::error::AppError;
 use crate::history::{
     self, HistoryEvent, HistoryRange, HistoryResponse, HistoryStatus, MonitorStatus, UptimeStats,
 };
+use crate::sync::{SyncEntry, SyncPlan, SyncResult};
 
 pub const HISTORY_RETENTION_DAYS: i64 = 90;
 
@@ -228,8 +229,10 @@ pub struct MonitorInput {
     pub cert_check_enabled: Option<bool>,
 }
 
+pub const DEFAULT_CHECK_INTERVAL_MINUTES: i64 = 5;
+
 fn default_interval() -> i64 {
-    5
+    DEFAULT_CHECK_INTERVAL_MINUTES
 }
 fn default_method() -> CheckMethod {
     CheckMethod::GET
@@ -394,13 +397,7 @@ impl Store {
     // --- monitors -----------------------------------------------------------
 
     pub fn list_monitors(&self) -> Result<Vec<Monitor>, AppError> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {MONITOR_COLUMNS} FROM monitors ORDER BY url"
-            ))?;
-            let rows = stmt.query_map([], monitor_from_row)?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
-        })
+        self.with_conn(|conn| list_monitors_inner(conn))
     }
 
     pub fn get_monitor(&self, id: i64) -> Result<Monitor, AppError> {
@@ -410,60 +407,15 @@ impl Store {
     pub fn create_monitor(&self, input: &MonitorInput) -> Result<Monitor, AppError> {
         let v = validate(input)?;
         self.with_conn(|conn| {
-            let now = now_utc();
-            conn.execute(
-                "INSERT INTO monitors
-                   (url, uptime_check_enabled, check_interval_minutes, check_method,
-                    look_for_string, cert_check_enabled, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-                params![
-                    v.url,
-                    v.uptime_check_enabled,
-                    v.check_interval_minutes,
-                    v.check_method.as_str(),
-                    v.look_for_string,
-                    resolve_cert_enabled(&v, true), // create: https defaults on
-                    now,
-                ],
-            )?;
-            get_monitor_inner(conn, conn.last_insert_rowid())
+            let id = insert_monitor(conn, &v)?;
+            get_monitor_inner(conn, id)
         })
     }
 
     pub fn update_monitor(&self, id: i64, input: &MonitorInput) -> Result<Monitor, AppError> {
         let v = validate(input)?;
         self.with_conn(|conn| {
-            let existing = get_monitor_inner(conn, id)?;
-            let cert_check_enabled = resolve_cert_enabled(&v, existing.cert_check_enabled);
-            let reset_certificate = cert_check_enabled
-                && (!existing.cert_check_enabled || existing.url != v.url);
-            let changed = conn.execute(
-                "UPDATE monitors SET
-                   url = ?1, uptime_check_enabled = ?2, check_interval_minutes = ?3,
-                   check_method = ?4, look_for_string = ?5, cert_check_enabled = ?6,
-                   cert_status = CASE WHEN ?7 THEN 'not_yet_checked' ELSE cert_status END,
-                   cert_expires_at = CASE WHEN ?7 THEN NULL ELSE cert_expires_at END,
-                   cert_issuer = CASE WHEN ?7 THEN NULL ELSE cert_issuer END,
-                   cert_failure_reason = CASE WHEN ?7 THEN NULL ELSE cert_failure_reason END,
-                   cert_last_check_at = CASE WHEN ?7 THEN NULL ELSE cert_last_check_at END,
-                   cert_expiry_alert_sent_at = CASE WHEN ?7 THEN NULL ELSE cert_expiry_alert_sent_at END,
-                   updated_at = ?8
-                 WHERE id = ?9",
-                params![
-                    v.url,
-                    v.uptime_check_enabled,
-                    v.check_interval_minutes,
-                    v.check_method.as_str(),
-                    v.look_for_string,
-                    cert_check_enabled,
-                    reset_certificate,
-                    now_utc(),
-                    id,
-                ],
-            )?;
-            if changed == 0 {
-                return Err(AppError::NotFound);
-            }
+            update_monitor_row(conn, id, &v)?;
             get_monitor_inner(conn, id)
         })
     }
@@ -476,6 +428,51 @@ impl Store {
                 return Err(AppError::NotFound);
             }
             Ok(())
+        })
+    }
+
+    // --- JSON sync ----------------------------------------------------------
+
+    /// Validate the entries and report what a sync would do, writing nothing.
+    pub fn preview_monitor_sync(
+        &self,
+        entries: &[SyncEntry],
+        delete_missing: bool,
+    ) -> Result<SyncPlan, AppError> {
+        self.with_conn(|conn| Ok(plan_sync(conn, entries, delete_missing)?.plan))
+    }
+
+    /// Re-validate and apply the sync in one transaction: any failure leaves
+    /// the database exactly as it was.
+    pub fn apply_monitor_sync(
+        &self,
+        entries: &[SyncEntry],
+        delete_missing: bool,
+    ) -> Result<SyncResult, AppError> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            let planned = plan_sync(&tx, entries, delete_missing)?;
+            for action in &planned.actions {
+                match action {
+                    SyncAction::Add(v) => {
+                        insert_monitor(&tx, v)?;
+                    }
+                    SyncAction::Update { id, input } => update_monitor_row(&tx, *id, input)?,
+                    SyncAction::Unchanged => {}
+                }
+            }
+            for id in &planned.delete_ids {
+                // check_results rows go with them via ON DELETE CASCADE.
+                tx.execute("DELETE FROM monitors WHERE id = ?1", params![id])?;
+            }
+            let result = SyncResult {
+                added: planned.plan.to_add.len(),
+                updated: planned.plan.to_update.len(),
+                deleted: planned.plan.to_delete.len(),
+                unchanged: planned.plan.unchanged.len(),
+            };
+            tx.commit()?;
+            Ok(result)
         })
     }
 
@@ -905,6 +902,165 @@ const MONITOR_COLUMNS: &str = "id, url, uptime_check_enabled, check_interval_min
      (SELECT response_time_ms FROM check_results c \
         WHERE c.monitor_id = monitors.id AND c.status != 'gap' \
         ORDER BY c.checked_at DESC, c.id DESC LIMIT 1) AS last_response_time_ms";
+
+/// What one sync entry resolves to once matched against the current rows.
+enum SyncAction {
+    Add(ValidatedInput),
+    Update { id: i64, input: ValidatedInput },
+    Unchanged,
+}
+
+/// The diff, plus the writes that would realize it.
+struct PlannedSync {
+    plan: SyncPlan,
+    actions: Vec<SyncAction>,
+    delete_ids: Vec<i64>,
+}
+
+/// Validate every entry, match it to a monitor by URL, and work out the diff.
+/// Nothing is written here; `apply_monitor_sync` runs it inside its transaction
+/// so the plan it acts on is computed against the rows it is about to change.
+fn plan_sync(
+    conn: &Connection,
+    entries: &[SyncEntry],
+    delete_missing: bool,
+) -> Result<PlannedSync, AppError> {
+    let existing = list_monitors_inner(conn)?;
+    let by_url: std::collections::HashMap<&str, &Monitor> =
+        existing.iter().map(|m| (m.url.as_str(), m)).collect();
+
+    let mut plan = SyncPlan {
+        delete_missing,
+        ..SyncPlan::default()
+    };
+    let mut actions = Vec::with_capacity(entries.len());
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for (index, entry) in entries.iter().enumerate() {
+        let url = entry.url.trim().to_string();
+        if let Some(first) = seen.get(&url) {
+            return Err(crate::sync::entry_error(
+                index,
+                format!("duplicate URL {url} (already listed as entry {})", first + 1),
+            ));
+        }
+        let current = by_url.get(url.as_str()).copied();
+        let input = crate::sync::merge_entry(entry, current);
+        let validated = validate(&input).map_err(|e| prefix_entry_error(index, e))?;
+        seen.insert(url.clone(), index);
+
+        match current {
+            None => {
+                plan.to_add.push(validated.url.clone());
+                actions.push(SyncAction::Add(validated));
+            }
+            Some(monitor) if entry_changes_monitor(&validated, monitor) => {
+                plan.to_update.push(validated.url.clone());
+                actions.push(SyncAction::Update {
+                    id: monitor.id,
+                    input: validated,
+                });
+            }
+            Some(monitor) => {
+                plan.unchanged.push(monitor.url.clone());
+                actions.push(SyncAction::Unchanged);
+            }
+        }
+    }
+
+    let mut delete_ids = Vec::new();
+    if delete_missing {
+        for monitor in existing.iter().filter(|m| !seen.contains_key(&m.url)) {
+            plan.to_delete.push(monitor.url.clone());
+            delete_ids.push(monitor.id);
+        }
+    }
+    Ok(PlannedSync {
+        plan,
+        actions,
+        delete_ids,
+    })
+}
+
+fn entry_changes_monitor(v: &ValidatedInput, monitor: &Monitor) -> bool {
+    v.check_interval_minutes != monitor.check_interval_minutes
+        || v.check_method != monitor.check_method
+        || v.look_for_string != monitor.look_for_string
+        || v.uptime_check_enabled != monitor.uptime_check_enabled
+        || resolve_cert_enabled(v, monitor.cert_check_enabled) != monitor.cert_check_enabled
+}
+
+/// Keep the error variant (the UI matches on `code`) and name the entry.
+fn prefix_entry_error(index: usize, error: AppError) -> AppError {
+    match error {
+        AppError::InvalidUrl(message) => {
+            AppError::InvalidUrl(format!("entry {}: {message}", index + 1))
+        }
+        other => crate::sync::entry_error(index, other.to_string()),
+    }
+}
+
+fn list_monitors_inner(conn: &Connection) -> Result<Vec<Monitor>, AppError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MONITOR_COLUMNS} FROM monitors ORDER BY url"
+    ))?;
+    let rows = stmt.query_map([], monitor_from_row)?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn insert_monitor(conn: &Connection, v: &ValidatedInput) -> Result<i64, AppError> {
+    conn.execute(
+        "INSERT INTO monitors
+           (url, uptime_check_enabled, check_interval_minutes, check_method,
+            look_for_string, cert_check_enabled, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        params![
+            v.url,
+            v.uptime_check_enabled,
+            v.check_interval_minutes,
+            v.check_method.as_str(),
+            v.look_for_string,
+            resolve_cert_enabled(v, true), // create: https defaults on
+            now_utc(),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn update_monitor_row(conn: &Connection, id: i64, v: &ValidatedInput) -> Result<(), AppError> {
+    let existing = get_monitor_inner(conn, id)?;
+    let cert_check_enabled = resolve_cert_enabled(v, existing.cert_check_enabled);
+    let reset_certificate =
+        cert_check_enabled && (!existing.cert_check_enabled || existing.url != v.url);
+    let changed = conn.execute(
+        "UPDATE monitors SET
+           url = ?1, uptime_check_enabled = ?2, check_interval_minutes = ?3,
+           check_method = ?4, look_for_string = ?5, cert_check_enabled = ?6,
+           cert_status = CASE WHEN ?7 THEN 'not_yet_checked' ELSE cert_status END,
+           cert_expires_at = CASE WHEN ?7 THEN NULL ELSE cert_expires_at END,
+           cert_issuer = CASE WHEN ?7 THEN NULL ELSE cert_issuer END,
+           cert_failure_reason = CASE WHEN ?7 THEN NULL ELSE cert_failure_reason END,
+           cert_last_check_at = CASE WHEN ?7 THEN NULL ELSE cert_last_check_at END,
+           cert_expiry_alert_sent_at = CASE WHEN ?7 THEN NULL ELSE cert_expiry_alert_sent_at END,
+           updated_at = ?8
+         WHERE id = ?9",
+        params![
+            v.url,
+            v.uptime_check_enabled,
+            v.check_interval_minutes,
+            v.check_method.as_str(),
+            v.look_for_string,
+            cert_check_enabled,
+            reset_certificate,
+            now_utc(),
+            id,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(())
+}
 
 fn get_monitor_inner(conn: &Connection, id: i64) -> Result<Monitor, AppError> {
     conn.query_row(
@@ -1791,6 +1947,209 @@ mod tests {
         }
 
         assert!(started.elapsed() < StdDuration::from_secs(1));
+    }
+
+    fn entries(json: &str) -> Vec<SyncEntry> {
+        crate::sync::parse_entries(json).unwrap()
+    }
+
+    #[test]
+    fn sync_previews_and_applies_the_same_diff() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_monitor(&input("https://keep.test")).unwrap();
+        store.create_monitor(&input("https://gone.test")).unwrap();
+
+        let entries = entries(
+            r#"[
+                 {"url": "https://keep.test", "check_interval_minutes": 5},
+                 {"url": "https://new.test", "check_interval_minutes": 15}
+               ]"#,
+        );
+
+        let plan = store.preview_monitor_sync(&entries, true).unwrap();
+        assert_eq!(plan.to_add, vec!["https://new.test"]);
+        assert!(plan.to_update.is_empty());
+        assert_eq!(plan.to_delete, vec!["https://gone.test"]);
+        assert_eq!(plan.unchanged, vec!["https://keep.test"]);
+
+        let result = store.apply_monitor_sync(&entries, true).unwrap();
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.unchanged, 1);
+
+        let urls: Vec<String> = store
+            .list_monitors()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.url)
+            .collect();
+        assert_eq!(urls, vec!["https://keep.test", "https://new.test"]);
+    }
+
+    #[test]
+    fn sync_without_delete_missing_keeps_absent_monitors() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_monitor(&input("https://gone.test")).unwrap();
+
+        let entries = entries(r#"[{"url": "https://new.test"}]"#);
+        let plan = store.preview_monitor_sync(&entries, false).unwrap();
+        assert!(plan.to_delete.is_empty());
+
+        let result = store.apply_monitor_sync(&entries, false).unwrap();
+        assert_eq!(result.deleted, 0);
+        assert_eq!(store.list_monitors().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sync_merge_updates_only_the_keys_present() {
+        let store = Store::open_in_memory().unwrap();
+        let mut created = input("https://example.com");
+        created.check_method = CheckMethod::POST;
+        created.look_for_string = "ok".into();
+        created.uptime_check_enabled = false;
+        let before = store.create_monitor(&created).unwrap();
+
+        let entries = entries(
+            r#"[{"url": "https://example.com", "check_interval_minutes": 30}]"#,
+        );
+        assert_eq!(
+            store.preview_monitor_sync(&entries, false).unwrap().to_update,
+            vec!["https://example.com"]
+        );
+        store.apply_monitor_sync(&entries, false).unwrap();
+
+        let after = store.get_monitor(before.id).unwrap();
+        assert_eq!(after.check_interval_minutes, 30);
+        assert_eq!(after.check_method, CheckMethod::POST);
+        assert_eq!(after.look_for_string, "ok");
+        assert!(!after.uptime_check_enabled);
+        assert_eq!(after.cert_check_enabled, before.cert_check_enabled);
+    }
+
+    #[test]
+    fn sync_switching_to_head_clears_an_inherited_look_for_string() {
+        let store = Store::open_in_memory().unwrap();
+        let mut created = input("https://example.com");
+        created.look_for_string = "ok".into();
+        let before = store.create_monitor(&created).unwrap();
+
+        store
+            .apply_monitor_sync(
+                &entries(r#"[{"url": "https://example.com", "check_method": "HEAD"}]"#),
+                false,
+            )
+            .unwrap();
+
+        let after = store.get_monitor(before.id).unwrap();
+        assert_eq!(after.check_method, CheckMethod::HEAD);
+        assert_eq!(after.look_for_string, "");
+    }
+
+    #[test]
+    fn sync_deletes_check_history_with_the_monitor() {
+        let store = Store::open_in_memory().unwrap();
+        let gone = store.create_monitor(&input("https://gone.test")).unwrap();
+        insert_result(&store, gone.id, Utc::now(), "up", Some(120), None);
+
+        store.apply_monitor_sync(&[], true).unwrap();
+
+        let remaining: i64 = store
+            .with_conn(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM check_results", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn sync_new_https_entries_get_certificate_checks_unless_stated() {
+        let store = Store::open_in_memory().unwrap();
+        let applied = store
+            .apply_monitor_sync(
+                &entries(
+                    r#"[
+                         {"url": "https://on.test"},
+                         {"url": "https://off.test", "cert_check_enabled": false},
+                         {"url": "http://plain.test"}
+                       ]"#,
+                ),
+                false,
+            )
+            .unwrap();
+        assert_eq!(applied.added, 3);
+
+        let by_url: std::collections::HashMap<String, bool> = store
+            .list_monitors()
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.url, m.cert_check_enabled))
+            .collect();
+        assert_eq!(by_url["https://on.test"], true);
+        assert_eq!(by_url["https://off.test"], false);
+        assert_eq!(by_url["http://plain.test"], false);
+    }
+
+    #[test]
+    fn sync_rejects_invalid_entries_and_writes_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        let existing = store.create_monitor(&input("https://example.com")).unwrap();
+
+        let cases: Vec<(&str, &str)> = vec![
+            (
+                r#"[{"url": "https://new.test"}, {"url": "ftp://bad.test"}]"#,
+                "entry 2",
+            ),
+            (
+                r#"[{"url": "https://new.test"}, {"url": "https://bad.test", "check_interval_minutes": 0}]"#,
+                "entry 2",
+            ),
+            (
+                r#"[{"url": "https://bad.test", "check_method": "HEAD", "look_for_string": "ok"}]"#,
+                "entry 1",
+            ),
+            (
+                r#"[{"url": "https://dupe.test"}, {"url": "https://dupe.test"}]"#,
+                "duplicate URL",
+            ),
+            // A valid update ahead of the failure: it must roll back too.
+            (
+                r#"[{"url": "https://example.com", "check_interval_minutes": 42}, {"url": "ftp://bad.test"}]"#,
+                "entry 2",
+            ),
+        ];
+        for (json, expected) in cases {
+            let parsed = entries(json);
+            let preview_error = store.preview_monitor_sync(&parsed, true).unwrap_err();
+            assert!(
+                preview_error.to_string().contains(expected),
+                "{preview_error} should mention {expected}"
+            );
+            // The apply path aborts on the same rule, and its transaction rolls
+            // back whatever the valid entries ahead of the failure did.
+            let apply_error = store.apply_monitor_sync(&parsed, true).unwrap_err();
+            assert!(apply_error.to_string().contains(expected));
+
+            let monitors = store.list_monitors().unwrap();
+            assert_eq!(monitors.len(), 1, "database changed for: {json}");
+            let survivor = &monitors[0];
+            assert_eq!(survivor.id, existing.id);
+            // Every editable column is untouched, so a valid entry ahead of the
+            // failure cannot have half-applied.
+            assert_eq!(survivor.url, existing.url, "url changed for: {json}");
+            assert_eq!(
+                survivor.check_interval_minutes, existing.check_interval_minutes,
+                "interval changed for: {json}"
+            );
+            assert_eq!(survivor.check_method, existing.check_method);
+            assert_eq!(survivor.look_for_string, existing.look_for_string);
+            assert_eq!(survivor.uptime_check_enabled, existing.uptime_check_enabled);
+            assert_eq!(survivor.cert_check_enabled, existing.cert_check_enabled);
+            assert_eq!(
+                survivor.updated_at, existing.updated_at,
+                "row was rewritten for: {json}"
+            );
+        }
     }
 
     #[test]

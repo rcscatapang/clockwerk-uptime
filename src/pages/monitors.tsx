@@ -1,7 +1,9 @@
 import { useState } from "react";
-import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Pencil, Plus, RefreshCw, Trash2, Upload } from "lucide-react";
+import { toast } from "sonner";
 
 import { DeleteMonitorDialog } from "@/components/delete-monitor-dialog";
+import { ImportMonitorsDialog } from "@/components/import-monitors-dialog";
 import { MonitorFormDialog } from "@/components/monitor-form-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,9 +16,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { errorMessage } from "@/lib/errors";
 import { formatMs, formatTimeAgo } from "@/lib/format";
 import { monitorToInput } from "@/lib/monitor-form";
 import { useCheckNow, useMonitors, useUpdateMonitor } from "@/lib/queries";
+import { pickMonitorSyncFile } from "@/lib/tauri";
 import type { Monitor, UptimeStatus } from "@/lib/tauri";
 
 const STATUS_LABELS: Record<UptimeStatus, string> = {
@@ -75,6 +79,21 @@ export function MonitorsPage() {
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Monitor | undefined>(undefined);
   const [deleting, setDeleting] = useState<Monitor | null>(null);
+  const [syncPath, setSyncPath] = useState<string | null>(null);
+  const [deleteMissing, setDeleteMissing] = useState(false);
+
+  // The picker is a native dialog, not a data command: it hands back a path
+  // that the preview/apply commands read on the Rust side.
+  const openImport = async () => {
+    try {
+      const path = await pickMonitorSyncFile();
+      if (path === null) return;
+      setDeleteMissing(false);
+      setSyncPath(path);
+    } catch (error) {
+      toast.error(errorMessage(error));
+    }
+  };
 
   const openAdd = () => {
     setEditing(undefined);
@@ -95,11 +114,16 @@ export function MonitorsPage() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Monitors</h1>
-        {(monitors.data?.length ?? 0) > 0 && (
-          <Button onClick={openAdd}>
-            <Plus /> Add monitor
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={openImport}>
+            <Upload /> Import / Sync
           </Button>
-        )}
+          {(monitors.data?.length ?? 0) > 0 && (
+            <Button onClick={openAdd}>
+              <Plus /> Add monitor
+            </Button>
+          )}
+        </div>
       </div>
 
       {monitors.isPending ? (
@@ -208,6 +232,12 @@ export function MonitorsPage() {
       <DeleteMonitorDialog
         monitor={deleting}
         onOpenChange={(open) => !open && setDeleting(null)}
+      />
+      <ImportMonitorsDialog
+        path={syncPath}
+        onOpenChange={(open) => !open && setSyncPath(null)}
+        deleteMissing={deleteMissing}
+        onDeleteMissingChange={setDeleteMissing}
       />
     </div>
   );
